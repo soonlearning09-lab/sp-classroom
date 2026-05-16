@@ -1130,7 +1130,8 @@
 
   /* ===== FAB (Floating Action Button) ===== */
   .fab{
-    position:fixed; right:20px; bottom:88px;
+    position:fixed; right:20px;
+    bottom:calc(76px + max(6px, env(safe-area-inset-bottom)));
     width:56px; height:56px; border-radius:50%;
     background:linear-gradient(135deg, var(--pri), var(--pri2));
     color:#fff; font-size:28px; font-weight:300;
