@@ -1076,6 +1076,20 @@
   }
   .icon-btn:active{ background:var(--bd2); }
   .icon-btn.danger{ color:var(--err); }
+  .submission-row{
+    display:flex; align-items:center; gap:10px;
+    padding:10px 12px; border:1px solid var(--bd2);
+    border-radius:10px; margin-bottom:6px;
+    background:var(--card);
+  }
+  .submission-icon{ font-size:22px; flex-shrink:0; }
+  .submission-body{ flex:1; min-width:0; cursor:pointer; }
+  .submission-name{
+    font-weight:600; font-size:14px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    color:var(--pri);
+  }
+  .submission-meta{ font-size:11px; color:var(--t2); margin-top:2px; }
   .item-arrow{ color:var(--t3); font-size:18px; flex-shrink:0; }
 
   /* Subject chip on chapter card */
@@ -2359,7 +2373,15 @@ async function renderItemsList(view){
           linkBtn = `<button class="icon-btn link-btn" onclick="openLinkUrl(event, ${JSON.stringify(it.url).replace(/"/g,'&quot;')})" title="ทำข้อสอบ">📝</button>`;
         }
       }
-      const hasActions = linkBtn || isAdmin;
+      // ปุ่มไฟล์ส่ง (assignment เท่านั้น): student เห็นเสมอ, admin เห็นเสมอ
+      let fileBtn = '';
+      if(isAssign && !showDeleted){
+        const studentHasAccount = !isAdmin && currentProfile.student_id;
+        if(isAdmin || studentHasAccount){
+          fileBtn = `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openSubmissionsForItem('${it.id}')" title="ไฟล์ส่ง">📎</button>`;
+        }
+      }
+      const hasActions = linkBtn || fileBtn || isAdmin;
       html += `
         <div class="item-card" data-id="${it.id}">
           ${isAdmin && itemFilter === 'all' && !showDeleted ? '<div class="drag-handle">⋮⋮</div>' : ''}
@@ -2370,6 +2392,7 @@ async function renderItemsList(view){
           ${hasActions ? `
             <div class="item-actions">
               ${linkBtn}
+              ${fileBtn}
               ${isAdmin ? (showDeleted ? `
                 <button class="icon-btn" onclick="restoreItem2('items','${it.id}')" title="กู้คืน">↩️</button>
               ` : `
@@ -2413,6 +2436,247 @@ async function deleteItem(id, name){
   if(error){ toast(error.message, 'error'); return; }
   toast('ลบเรียบร้อย', 'success');
   renderCurrentView();
+}
+
+// ====================================================
+// ====== SUBMISSIONS (File Upload สำหรับ Assignment) ==
+// ====================================================
+
+const MAX_FILES_PER_SUBMISSION = 10;
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+const ALLOWED_MIME = ['application/pdf', 'image/jpeg', 'image/png'];
+const ALLOWED_EXT = '.pdf,.jpg,.jpeg,.png';
+
+async function listSubmissions(itemId, studentId = null){
+  let q = sb.from('submissions').select('*').eq('item_id', itemId).order('uploaded_at');
+  if(studentId) q = q.eq('student_id', studentId);
+  const { data, error } = await q;
+  if(error){ console.error(error); return []; }
+  return data || [];
+}
+
+async function uploadSubmission(itemId, studentId, file){
+  const safeName = file.name.replace(/[^\w.\-]/g, '_');
+  const path = `${itemId}/${studentId}/${Date.now()}-${safeName}`;
+  const { error: upErr } = await sb.storage.from('submissions').upload(path, file, {
+    cacheControl: '3600', upsert: false
+  });
+  if(upErr) throw upErr;
+  const { error: dbErr } = await sb.from('submissions').insert({
+    item_id: itemId, student_id: studentId, file_path: path,
+    file_name: file.name, file_size: file.size, mime_type: file.type
+  });
+  if(dbErr){
+    // rollback uploaded file
+    await sb.storage.from('submissions').remove([path]);
+    throw dbErr;
+  }
+}
+
+async function deleteSubmission(submission){
+  // ลบ file ใน storage ก่อน (failed-silent ก็ยังไปต่อเพื่อให้ DB row หาย)
+  await sb.storage.from('submissions').remove([submission.file_path]);
+  const { error } = await sb.from('submissions').delete().eq('id', submission.id);
+  if(error) throw error;
+}
+
+async function downloadSubmission(submission){
+  const { data, error } = await sb.storage.from('submissions')
+    .createSignedUrl(submission.file_path, 3600);
+  if(error || !data){ toast('ไม่สามารถเปิดไฟล์ได้', 'error'); return; }
+  window.open(data.signedUrl, '_blank', 'noopener,noreferrer');
+}
+
+function fmtFileSize(bytes){
+  if(bytes < 1024) return bytes + ' B';
+  if(bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  return (bytes/(1024*1024)).toFixed(1) + ' MB';
+}
+
+function fileIcon(mime){
+  if(mime?.startsWith('image/')) return '🖼️';
+  if(mime === 'application/pdf') return '📄';
+  return '📎';
+}
+
+async function openSubmissionsModal(item, studentIdContext = null){
+  const isAdmin = currentProfile.role === 'admin';
+  // student → เปิดของตัวเองเท่านั้น
+  // admin in tracking → studentIdContext = student คนนั้น
+  // admin in curriculum → studentIdContext = null → ดูทุก student
+  const filterStudentId = isAdmin ? studentIdContext : currentProfile.student_id;
+
+  const subs = await listSubmissions(item.id, filterStudentId);
+
+  // ถ้า admin + filterStudentId null → ต้อง load student names
+  let studentsMap = {};
+  if(isAdmin && !filterStudentId){
+    const ids = [...new Set(subs.map(s => s.student_id))];
+    if(ids.length > 0){
+      const { data } = await sb.from('students').select('id, nickname').in('id', ids);
+      (data || []).forEach(s => { studentsMap[s.id] = s.nickname; });
+    }
+  }
+
+  // student → ดู count + ปุ่มเพิ่ม
+  const canUpload = !isAdmin && filterStudentId && subs.length < MAX_FILES_PER_SUBMISSION;
+  const myCount = subs.length; // จะตรงกับของตัวเอง (student) เสมอ
+
+  let bodyHtml = '';
+
+  // Upload section (student only)
+  if(!isAdmin){
+    bodyHtml += `
+      <div style="margin-bottom:16px;">
+        <div style="font-size:13px;color:var(--t2);margin-bottom:8px;">
+          ${myCount}/${MAX_FILES_PER_SUBMISSION} ไฟล์ · สูงสุด 5 MB/ไฟล์ · PDF/JPG/PNG
+        </div>
+        ${canUpload ? `
+          <input type="file" id="m_sub_files" accept="${ALLOWED_EXT}" multiple
+            style="display:none;" onchange="onSubmissionFilesPicked('${item.id}', '${filterStudentId}')">
+          <button class="btn-primary" style="width:100%;padding:12px;" onclick="document.getElementById('m_sub_files').click()">
+            📎 เลือกไฟล์อัปโหลด
+          </button>
+        ` : (myCount >= MAX_FILES_PER_SUBMISSION ? `
+          <div style="padding:12px;background:#FEF3C7;color:#92400E;border-radius:8px;font-size:13px;text-align:center;">
+            ครบ ${MAX_FILES_PER_SUBMISSION} ไฟล์แล้ว — ลบของเก่าก่อนถ้าต้องการเพิ่ม
+          </div>
+        ` : '')}
+      </div>
+    `;
+  }
+
+  // List section
+  if(subs.length === 0){
+    bodyHtml += `
+      <div style="padding:24px;text-align:center;color:var(--t3);font-size:13px;">
+        ยังไม่มีไฟล์
+      </div>
+    `;
+  } else {
+    bodyHtml += '<div id="submissionsList">';
+    // ถ้า admin + ดูทุก student → group by student
+    if(isAdmin && !filterStudentId){
+      const byStudent = {};
+      subs.forEach(s => { (byStudent[s.student_id] = byStudent[s.student_id] || []).push(s); });
+      for(const sid of Object.keys(byStudent)){
+        bodyHtml += `<div style="font-weight:700;font-size:13px;color:var(--t2);margin:8px 0 4px;">
+          ${escapeHtml(studentsMap[sid] || 'ไม่ทราบชื่อ')} (${byStudent[sid].length})
+        </div>`;
+        bodyHtml += byStudent[sid].map(s => renderSubmissionRow(s, isAdmin, !isAdmin)).join('');
+      }
+    } else {
+      bodyHtml += subs.map(s => renderSubmissionRow(s, isAdmin, !isAdmin)).join('');
+    }
+    bodyHtml += '</div>';
+  }
+
+  showModal({
+    title: `📎 ไฟล์ส่ง: ${escapeHtml(item.title)}`,
+    body: bodyHtml,
+    onSave: null, // ไม่มีปุ่ม save — เป็น view/manage modal
+    saveText: ''
+  });
+}
+
+function renderSubmissionRow(s, canAdminDelete, canStudentDelete){
+  const deleteBtn = (canAdminDelete || canStudentDelete)
+    ? `<button class="icon-btn danger" onclick="confirmDeleteSubmission('${s.id}', \`${escapeHtml(s.file_name).replace(/`/g,'\\`')}\`)" title="ลบ">🗑️</button>`
+    : '';
+  return `
+    <div class="submission-row">
+      <div class="submission-icon">${fileIcon(s.mime_type)}</div>
+      <div class="submission-body" onclick='downloadSubmissionById("${s.id}")'>
+        <div class="submission-name">${escapeHtml(s.file_name)}</div>
+        <div class="submission-meta">${fmtFileSize(s.file_size || 0)} · ${fmtDate(s.uploaded_at)}</div>
+      </div>
+      ${deleteBtn}
+    </div>
+  `;
+}
+
+// helper ที่ row ใช้
+async function downloadSubmissionById(submissionId){
+  const { data } = await sb.from('submissions').select('*').eq('id', submissionId).single();
+  if(data) downloadSubmission(data);
+}
+
+async function confirmDeleteSubmission(submissionId, fileName){
+  if(!confirm(`ลบไฟล์ "${fileName}"?\n\nไฟล์จะถูกลบถาวรและกู้คืนไม่ได้`)) return;
+  const { data: sub } = await sb.from('submissions').select('*').eq('id', submissionId).single();
+  if(!sub){ toast('ไม่พบไฟล์', 'error'); return; }
+  try{
+    await deleteSubmission(sub);
+    toast('ลบไฟล์เรียบร้อย', 'success');
+    // refresh modal — close + reopen
+    document.querySelectorAll('.modal-bg').forEach(m => m.remove());
+    const { data: it } = await sb.from('items').select('*').eq('id', sub.item_id).single();
+    if(it){
+      // หา context: ถ้า admin in tracking ก็เปิดของ student คนนั้น, ถ้า student ก็ของตัวเอง
+      const sidCtx = (currentProfile.role === 'admin') ? sub.student_id : null;
+      // หา student in tracking from navStack
+      const v = navStack[navStack.length-1];
+      const fromTracking = currentTab === 'tracking' && v?.studentId;
+      openSubmissionsModal(it, fromTracking ? v.studentId : (currentProfile.role === 'admin' ? null : undefined));
+    }
+  } catch(err){
+    toast(err.message || 'ลบไม่สำเร็จ', 'error');
+  }
+}
+
+async function onSubmissionFilesPicked(itemId, studentId){
+  const input = $('m_sub_files');
+  const files = Array.from(input.files || []);
+  if(files.length === 0) return;
+
+  // check current count
+  const existing = await listSubmissions(itemId, studentId);
+  const remaining = MAX_FILES_PER_SUBMISSION - existing.length;
+  if(files.length > remaining){
+    toast(`เกินจำนวน — เพิ่มได้อีก ${remaining} ไฟล์เท่านั้น`, 'error');
+    input.value = '';
+    return;
+  }
+
+  // validate sizes + types
+  for(const f of files){
+    if(f.size > MAX_FILE_SIZE){
+      toast(`"${f.name}" เกิน 5 MB`, 'error');
+      input.value = '';
+      return;
+    }
+    if(!ALLOWED_MIME.includes(f.type)){
+      toast(`"${f.name}" ไม่ใช่ PDF/JPG/PNG`, 'error');
+      input.value = '';
+      return;
+    }
+  }
+
+  toast(`กำลังอัปโหลด ${files.length} ไฟล์...`, 'info');
+  let ok = 0, fail = 0;
+  for(const f of files){
+    try{
+      await uploadSubmission(itemId, studentId, f);
+      ok++;
+    } catch(err){
+      console.error(err);
+      fail++;
+    }
+  }
+  input.value = '';
+  toast(fail === 0 ? `อัปโหลด ${ok} ไฟล์เรียบร้อย` : `อัปโหลดสำเร็จ ${ok} ไฟล์ · ล้มเหลว ${fail}`, fail === 0 ? 'success' : 'error');
+
+  // refresh modal
+  document.querySelectorAll('.modal-bg').forEach(m => m.remove());
+  const { data: it } = await sb.from('items').select('*').eq('id', itemId).single();
+  if(it) openSubmissionsModal(it);
+}
+
+function openSubmissionsForItem(itemId, studentIdContext){
+  // fetch item แล้วเปิด modal
+  sb.from('items').select('*').eq('id', itemId).single().then(({data}) => {
+    if(data) openSubmissionsModal(data, studentIdContext || null);
+  });
 }
 
 function openItemModal(item){
@@ -3549,6 +3813,9 @@ function renderTrackItem(item, prog, today, studentId, examInfo){
         <div class="track-item-title">${escapeHtml(item.title)}</div>
         <div class="track-item-meta">${metaHtml}</div>
       </div>
+      ${isAssign ? `
+        <button class="icon-btn link-btn" style="margin-left:auto;" onclick="event.stopPropagation(); openSubmissionsForItem('${item.id}', '${studentId}')" title="ไฟล์ส่ง">📎</button>
+      ` : ''}
     </div>`;
 }
 
@@ -6107,27 +6374,30 @@ function setupSortable(elemId, tableName){
 function showModal({ title, body, onSave, saveText='บันทึก' }){
   const bg = document.createElement('div');
   bg.className = 'modal-bg';
+  const viewOnly = !onSave;
   bg.innerHTML = `
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-handle"></div>
       <div class="modal-title">${title}</div>
       <div id="modalBody">${body}</div>
       <div class="modal-actions">
-        <button class="btn-sec" id="modalCancel">ยกเลิก</button>
-        <button class="btn-pri" id="modalSave" style="margin-top:0;">${saveText}</button>
+        <button class="btn-sec" id="modalCancel">${viewOnly ? 'ปิด' : 'ยกเลิก'}</button>
+        ${viewOnly ? '' : `<button class="btn-pri" id="modalSave" style="margin-top:0;">${saveText}</button>`}
       </div>
     </div>
   `;
   document.body.appendChild(bg);
   bg.addEventListener('click', () => closeModal(bg));
   bg.querySelector('#modalCancel').onclick = () => closeModal(bg);
-  bg.querySelector('#modalSave').onclick = async () => {
-    const btn = bg.querySelector('#modalSave');
-    btn.disabled = true; btn.textContent = 'กำลังบันทึก...';
-    const ok = await onSave();
-    btn.disabled = false; btn.textContent = saveText;
-    if(ok !== false) closeModal(bg);
-  };
+  if(!viewOnly){
+    bg.querySelector('#modalSave').onclick = async () => {
+      const btn = bg.querySelector('#modalSave');
+      btn.disabled = true; btn.textContent = 'กำลังบันทึก...';
+      const ok = await onSave();
+      btn.disabled = false; btn.textContent = saveText;
+      if(ok !== false) closeModal(bg);
+    };
+  }
 }
 function closeModal(bg){
   bg.style.animation = 'fadeIn 0.2s reverse';
