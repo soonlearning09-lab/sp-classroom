@@ -1,6 +1,6 @@
 // SP - CLASSROOM Service Worker
 // เปลี่ยน version เมื่อ deploy ใหม่ — เพื่อให้ user ได้ไฟล์ใหม่
-const CACHE = 'sp-classroom-v7';
+const CACHE = 'sp-classroom-v8';
 
 const APP_SHELL = [
   './',

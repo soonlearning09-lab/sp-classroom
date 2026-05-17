@@ -2534,7 +2534,7 @@ async function openSubmissionsModal(item, studentIdContext = null){
         ${canUpload ? `
           <input type="file" id="m_sub_files" accept="${ALLOWED_EXT}" multiple
             style="display:none;" onchange="onSubmissionFilesPicked('${item.id}', '${filterStudentId}')">
-          <button class="btn-primary" style="width:100%;padding:12px;" onclick="document.getElementById('m_sub_files').click()">
+          <button class="btn-pri" style="width:100%;padding:12px;margin-top:0;" onclick="document.getElementById('m_sub_files').click()">
             📎 เลือกไฟล์อัปโหลด
           </button>
         ` : (myCount >= MAX_FILES_PER_SUBMISSION ? `
