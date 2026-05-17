@@ -1094,6 +1094,7 @@
   .type-lesson{ background:var(--lesson-bg); color:var(--lesson); }
   .type-assign{ background:var(--assign-bg); color:var(--assign); }
   .type-exam{ background:var(--exam-bg); color:var(--exam); }
+  .type-resource{ background:#E0F2FE; color:#0369A1; }
 
   /* Filter chips */
   .filter-row{
@@ -2310,7 +2311,7 @@ async function renderItemsList(view){
   let html = renderDeletedToggle('รายการ');
 
   // count by type
-  const counts = { all:0, lesson:0, assignment:0, exam:0 };
+  const counts = { all:0, lesson:0, assignment:0, exam:0, resource:0 };
   (items || []).forEach(i => { counts.all++; counts[i.type]++; });
 
   // filter chips (ไม่แสดงตอนดู deleted)
@@ -2320,6 +2321,7 @@ async function renderItemsList(view){
       {key:'lesson', label:`📖 เนื้อหา (${counts.lesson})`},
       {key:'assignment', label:`📝 งาน (${counts.assignment})`},
       {key:'exam', label:`📊 สอบ (${counts.exam})`},
+      {key:'resource', label:`🔗 ลิงก์ (${counts.resource})`},
     ];
     html += '<div class="filter-row">';
     chips.forEach(c => {
@@ -2341,6 +2343,7 @@ async function renderItemsList(view){
       const isLesson = it.type === 'lesson';
       const isAssign = it.type === 'assignment';
       const isExam = it.type === 'exam';
+      const isResource = it.type === 'resource';
       let badge = '';
       if(isLesson) badge = `<span class="type-badge type-lesson">📖 เนื้อหา</span>`;
       else if(isAssign){
@@ -2349,11 +2352,18 @@ async function renderItemsList(view){
       } else if(isExam){
         const ms = it.max_score != null ? `เต็ม ${it.max_score} คะแนน` : 'ยังไม่ตั้งคะแนน';
         badge = `<span class="type-badge type-exam">📊 สอบ · ${ms}</span>`;
+      } else if(isResource){
+        const linkIcon = it.link_type === 'video' ? '🎬' : (it.link_type === 'pdf' ? '📄' : '🔗');
+        const linkLabel = it.link_type === 'video' ? 'วิดิโอ' : (it.link_type === 'pdf' ? 'เอกสาร' : 'ลิงก์');
+        badge = `<span class="type-badge type-resource">${linkIcon} ${linkLabel}</span>`;
       }
+      const clickAttr = (isResource && it.url && !showDeleted)
+        ? `style="cursor:pointer;" onclick="openResourceUrl(event, ${JSON.stringify(it.url).replace(/"/g,'&quot;')})"`
+        : '';
       html += `
         <div class="item-card" data-id="${it.id}">
           ${isAdmin && itemFilter === 'all' && !showDeleted ? '<div class="drag-handle">⋮⋮</div>' : ''}
-          <div class="item-body">
+          <div class="item-body" ${clickAttr}>
             <div class="item-meta" style="margin-bottom:4px;">${badge}</div>
             <div class="item-title">${escapeHtml(it.title)}</div>
           </div>
@@ -2384,6 +2394,12 @@ function setItemFilter(f){
   renderCurrentView();
 }
 
+function openResourceUrl(ev, url){
+  ev.stopPropagation();
+  if(!url) return;
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
 async function editItem(id){
   const { data: it } = await sb.from('items').select('*').eq('id', id).single();
   if(!it) return;
@@ -2411,6 +2427,7 @@ function openItemModal(item){
           <option value="lesson" ${initType==='lesson'?'selected':''}>📖 เนื้อหา</option>
           <option value="assignment" ${initType==='assignment'?'selected':''}>📝 งาน (มี deadline)</option>
           <option value="exam" ${initType==='exam'?'selected':''}>📊 สอบ (มีคะแนน)</option>
+          <option value="resource" ${initType==='resource'?'selected':''}>🔗 ลิงก์ (วิดิโอ/เอกสาร)</option>
         </select>
       </div>
       <div class="fg">
@@ -2425,12 +2442,24 @@ function openItemModal(item){
         <label>คะแนนเต็ม</label>
         <input id="m_it_score" type="number" min="0" step="0.5" placeholder="เช่น 20" value="${item?.max_score ?? ''}">
       </div>
+      <div class="fg ${initType==='resource' ? '' : 'hidden'}" id="m_it_url_wrap">
+        <label>URL *</label>
+        <input id="m_it_url" type="url" placeholder="https://... (YouTube / Google Drive)" value="${escapeHtml(item?.url || '')}">
+      </div>
+      <div class="fg ${initType==='resource' ? '' : 'hidden'}" id="m_it_linktype_wrap">
+        <label>ประเภทลิงก์</label>
+        <select id="m_it_linktype">
+          <option value="video" ${item?.link_type==='video'?'selected':''}>🎬 วิดิโอ</option>
+          <option value="pdf" ${item?.link_type==='pdf'?'selected':''}>📄 เอกสาร PDF</option>
+          <option value="other" ${(!item?.link_type || item?.link_type==='other')?'selected':''}>🔗 อื่น ๆ</option>
+        </select>
+      </div>
     `,
     onSave: async () => {
       const type = $('m_it_type').value;
       const title = $('m_it_title').value.trim();
       if(!title){ toast('กรอกชื่อรายการ', 'error'); return false; }
-      const payload = { type, title, deadline:null, max_score:null };
+      const payload = { type, title, deadline:null, max_score:null, url:null, link_type:null };
       if(type === 'assignment'){
         const d = $('m_it_deadline').value;
         payload.deadline = d ? new Date(d + 'T23:59:59').toISOString() : null;
@@ -2440,6 +2469,12 @@ function openItemModal(item){
           payload.max_score = parseFloat(s);
           if(isNaN(payload.max_score) || payload.max_score < 0){ toast('คะแนนไม่ถูกต้อง', 'error'); return false; }
         }
+      } else if(type === 'resource'){
+        const url = $('m_it_url').value.trim();
+        if(!url){ toast('กรอก URL', 'error'); return false; }
+        if(!/^https?:\/\//i.test(url)){ toast('URL ต้องเริ่มด้วย http:// หรือ https://', 'error'); return false; }
+        payload.url = url;
+        payload.link_type = $('m_it_linktype').value;
       }
       if(isEdit){
         const { error } = await sb.from('items').update(payload).eq('id', item.id);
@@ -2466,6 +2501,8 @@ function onItemTypeChange(){
   const t = $('m_it_type').value;
   $('m_it_deadline_wrap').classList.toggle('hidden', t !== 'assignment');
   $('m_it_score_wrap').classList.toggle('hidden', t !== 'exam');
+  $('m_it_url_wrap').classList.toggle('hidden', t !== 'resource');
+  $('m_it_linktype_wrap').classList.toggle('hidden', t !== 'resource');
 }
 
 // ====================================================
