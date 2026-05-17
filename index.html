@@ -3741,6 +3741,10 @@ function renderTrackItem(item, prog, today, studentId, examInfo){
       </div>`;
     }
 
+    const examFormBtn = item.url
+      ? `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ทำข้อสอบ">📝</button>`
+      : '';
+
     return `
       <div class="track-item exam" data-item-id="${item.id}">
         <div class="track-checkbox ${hasScore ? 'checked' : ''} no-action">
@@ -3754,6 +3758,7 @@ function renderTrackItem(item, prog, today, studentId, examInfo){
           ${scoreHtml}
           ${actionHtml}
         </div>
+        ${examFormBtn ? `<div class="track-item-actions" style="display:flex;gap:4px;margin-left:auto;">${examFormBtn}</div>` : ''}
       </div>`;
   }
 
@@ -3803,6 +3808,19 @@ function renderTrackItem(item, prog, today, studentId, examInfo){
     }
   }
 
+  // Action buttons: ▶️ (lesson+url), 📝 (exam+url), 📎 (assignment)
+  let actionBtns = '';
+  if(isLesson && item.url){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ดูวิดิโอ">▶️</button>`;
+  }
+  if(isExam && item.url){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ทำข้อสอบ">📝</button>`;
+  }
+  if(isAssign){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openSubmissionsForItem('${item.id}', '${studentId}')" title="ไฟล์ส่ง">📎</button>`;
+  }
+  const actionsHtml = actionBtns ? `<div class="track-item-actions" style="display:flex;gap:4px;margin-left:auto;">${actionBtns}</div>` : '';
+
   return `
     <div class="track-item ${rowClass}" data-item-id="${item.id}" data-deadline="${item.deadline || ''}">
       <div class="track-checkbox ${cbClass} ${!clickable ? 'no-action' : ''}"
@@ -3813,9 +3831,7 @@ function renderTrackItem(item, prog, today, studentId, examInfo){
         <div class="track-item-title">${escapeHtml(item.title)}</div>
         <div class="track-item-meta">${metaHtml}</div>
       </div>
-      ${isAssign ? `
-        <button class="icon-btn link-btn" style="margin-left:auto;" onclick="event.stopPropagation(); openSubmissionsForItem('${item.id}', '${studentId}')" title="ไฟล์ส่ง">📎</button>
-      ` : ''}
+      ${actionsHtml}
     </div>`;
 }
 
@@ -5269,6 +5285,19 @@ function renderStudentTrackItem(item, prog, today, examInfo){
   const isExam = item.type === 'exam';
   const completed = prog?.completed || false;
 
+  // ===== Action buttons (สำหรับทุก type) =====
+  let actionBtns = '';
+  if(isLesson && item.url){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ดูวิดิโอ">▶️</button>`;
+  }
+  if(isExam && item.url){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ทำข้อสอบ">📝</button>`;
+  }
+  if(isAssign && currentProfile.student_id){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openSubmissionsForItem('${item.id}')" title="ไฟล์ส่ง">📎</button>`;
+  }
+  const actionsHtml = actionBtns ? `<div class="track-item-actions" style="display:flex;gap:4px;margin-left:auto;">${actionBtns}</div>` : '';
+
   // exam
   if(isExam){
     const hasScore = !!examInfo;
@@ -5292,6 +5321,7 @@ function renderStudentTrackItem(item, prog, today, examInfo){
         <div class="track-item-meta"><span>📊 สอบ${item.max_score != null ? ` · เต็ม ${item.max_score} คะแนน` : ''}</span></div>
         ${scoreHtml}
       </div>
+      ${actionsHtml}
     </div>`;
   }
 
@@ -5329,6 +5359,7 @@ function renderStudentTrackItem(item, prog, today, examInfo){
       <div class="track-item-title">${escapeHtml(item.title)}</div>
       <div class="track-item-meta">${metaHtml}</div>
     </div>
+    ${actionsHtml}
   </div>`;
 }
 
