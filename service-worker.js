@@ -1,6 +1,6 @@
 // SP - CLASSROOM Service Worker
 // เปลี่ยน version เมื่อ deploy ใหม่ — เพื่อให้ user ได้ไฟล์ใหม่
-const CACHE = 'sp-classroom-v9';
+const CACHE = 'sp-classroom-v10';
 
 const APP_SHELL = [
   './',
@@ -8,6 +8,13 @@ const APP_SHELL = [
   './icon.svg',
   './manifest.json'
 ];
+
+// รับ message จาก client (เพื่อ activate SW ใหม่ทันทีโดยไม่ต้องปิดแอป)
+self.addEventListener('message', (event) => {
+  if(event.data?.type === 'SKIP_WAITING'){
+    self.skipWaiting();
+  }
+});
 
 // Install — pre-cache app shell
 self.addEventListener('install', (event) => {

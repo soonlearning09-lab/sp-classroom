@@ -6439,7 +6439,30 @@ function closeModal(bg){
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('service-worker.js')
+      .then(reg => {
+        // เช็ค update ทันทีตอนเปิดแอป
+        reg.update();
+        // ถ้ามี SW ใหม่กำลังรอ — บอกให้ activate ทันที + reload หน้า
+        reg.addEventListener('updatefound', () => {
+          const newSW = reg.installing;
+          if(!newSW) return;
+          newSW.addEventListener('statechange', () => {
+            if(newSW.state === 'installed' && navigator.serviceWorker.controller){
+              // มี SW ใหม่พร้อมใช้ — บอกให้ activate
+              newSW.postMessage({ type: 'SKIP_WAITING' });
+            }
+          });
+        });
+      })
       .catch(err => console.warn('SW register failed:', err));
+
+    // เมื่อ SW ใหม่ activate แล้ว → reload หน้าอัตโนมัติ
+    let refreshing = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if(refreshing) return;
+      refreshing = true;
+      window.location.reload();
+    });
   });
 }
 
