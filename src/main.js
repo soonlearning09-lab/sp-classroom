@@ -651,7 +651,7 @@ async function editTrack(id){
 
 async function deleteTrack(id, name){
   // นับสิ่งที่จะหายไป (chapters, topics, items, progress, exam_scores)
-  if(!confirm(`ต้องการลบ Track "${name}" หรือไม่?\n\n(เนื้อหาทั้งหมดใน Track นี้จะถูกซ่อน แต่ยังกู้คืนได้)`)) return;
+  if(!await confirmDialog(`ต้องการลบ Track "${name}" หรือไม่?\n\n(เนื้อหาทั้งหมดใน Track นี้จะถูกซ่อน แต่ยังกู้คืนได้)`)) return;
   const { error } = await sb.from('tracks').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   if(error){ toast('ลบไม่สำเร็จ: ' + error.message, 'error'); return; }
   toast('ลบเรียบร้อย', 'success');
@@ -815,7 +815,7 @@ async function editChapter(id){
 }
 
 async function deleteChapter(id, name){
-  if(!confirm(`ลบบท "${name}"?\n(เนื้อหาทั้งหมดในบทจะถูกซ่อน กู้คืนได้)`)) return;
+  if(!await confirmDialog(`ลบบท "${name}"?\n(เนื้อหาทั้งหมดในบทจะถูกซ่อน กู้คืนได้)`)) return;
   const { error } = await sb.from('chapters').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   if(error){ toast(error.message, 'error'); return; }
   toast('ลบเรียบร้อย', 'success');
@@ -920,7 +920,7 @@ async function editTopic(id){
 }
 
 async function deleteTopic(id, name){
-  if(!confirm(`ลบหัวข้อ "${name}"?`)) return;
+  if(!await confirmDialog(`ลบหัวข้อ "${name}"?`)) return;
   const { error } = await sb.from('topics').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   if(error){ toast(error.message, 'error'); return; }
   toast('ลบเรียบร้อย', 'success');
@@ -1083,7 +1083,7 @@ async function editItem(id){
 }
 
 async function deleteItem(id, name){
-  if(!confirm(`ลบรายการ "${name}"?`)) return;
+  if(!await confirmDialog(`ลบรายการ "${name}"?`)) return;
   const { error } = await sb.from('items').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   if(error){ toast(error.message, 'error'); return; }
   toast('ลบเรียบร้อย', 'success');
@@ -1254,7 +1254,7 @@ async function downloadSubmissionById(submissionId){
 }
 
 async function confirmDeleteSubmission(submissionId, fileName){
-  if(!confirm(`ลบไฟล์ "${fileName}"?\n\nไฟล์จะถูกลบถาวรและกู้คืนไม่ได้`)) return;
+  if(!await confirmDialog(`ลบไฟล์ "${fileName}"?\n\nไฟล์จะถูกลบถาวรและกู้คืนไม่ได้`)) return;
   const { data: sub } = await sb.from('submissions').select('*').eq('id', submissionId).single();
   if(!sub){ toast('ไม่พบไฟล์', 'error'); return; }
   try{
@@ -1544,7 +1544,7 @@ function openStudent(id, name){
 }
 
 async function deleteStudent(id, name){
-  if(!confirm(`ลบนักเรียน "${name}"?\n(progress, คะแนน, การมาเรียนทั้งหมดจะถูกซ่อน กู้คืนได้)`)) return;
+  if(!await confirmDialog(`ลบนักเรียน "${name}"?\n(progress, คะแนน, การมาเรียนทั้งหมดจะถูกซ่อน กู้คืนได้)`)) return;
   const { error } = await sb.from('students').update({ deleted_at: new Date().toISOString() }).eq('id', id);
   if(error){ toast(error.message, 'error'); return; }
   toast('ลบเรียบร้อย', 'success');
@@ -1902,7 +1902,7 @@ async function openLinkStudent(studentId, studentName){
 }
 
 async function unlinkStudent(profileId, studentName){
-  if(!confirm(`ยกเลิกการลิงก์บัญชีกับ "${studentName}"?\n(บัญชีจะกลับเป็น viewer)`)) return;
+  if(!await confirmDialog(`ยกเลิกการลิงก์บัญชีกับ "${studentName}"?\n(บัญชีจะกลับเป็น viewer)`)) return;
   const { error } = await sb.from('profiles').update({
     student_id: null,
     role: 'viewer'
@@ -2061,7 +2061,7 @@ function onApproveStudentChange(){
 }
 
 async function rejectPending(profileId, email){
-  if(!confirm(`ปฏิเสธคำขอจาก "${email}"?\n(บัญชีจะถูกลบออกจาก profiles)`)) return;
+  if(!await confirmDialog(`ปฏิเสธคำขอจาก "${email}"?\n(บัญชีจะถูกลบออกจาก profiles)`)) return;
   // ลบ profile (auth.users ยังอยู่ — admin ลบเองได้ใน Supabase)
   const { error } = await sb.from('profiles').delete().eq('id', profileId);
   if(error){ toast(error.message, 'error'); return; }
@@ -2629,7 +2629,7 @@ function openExamScore(studentId, itemId, title, maxScore, existing){
       const score = parseFloat($('m_es_score').value);
       if(isNaN(score) || score < 0){ toast('กรอกคะแนน', 'error'); return false; }
       if(maxScore != null && score > maxScore){
-        if(!confirm(`คะแนน ${score} เกินเต็ม ${maxScore} — ยืนยันบันทึก?`)) return false;
+        if(!await confirmDialog(`คะแนน ${score} เกินเต็ม ${maxScore} — ยืนยันบันทึก?`)) return false;
       }
       const examDate = $('m_es_date').value || null;
       const note = $('m_es_note').value.trim() || null;
@@ -2731,7 +2731,7 @@ async function editExamScore(scoreId, studentId, itemId, title, maxScore){
 }
 
 async function deleteExamScore(scoreId, title, attemptNo){
-  if(!confirm(`ลบคะแนนสอบครั้งที่ ${attemptNo} ของ "${title}"?`)) return;
+  if(!await confirmDialog(`ลบคะแนนสอบครั้งที่ ${attemptNo} ของ "${title}"?`)) return;
   const { error } = await sb.from('exam_scores').delete().eq('id', scoreId);
   if(error){ toast(error.message, 'error'); return; }
   toast('ลบเรียบร้อย', 'success');
@@ -3390,7 +3390,7 @@ async function bulkSetAll(status, onlyUnset){
   const confirmMsg = onlyUnset 
     ? `ติ๊กเฉพาะคนที่ยังไม่เช็ค เป็น "${statusLabel(status)}"?`
     : `ติ๊กทุกคน เป็น "${statusLabel(status)}"? (จะทับของเดิม)`;
-  if(!confirm(confirmMsg)) return;
+  if(!await confirmDialog(confirmMsg)) return;
   closeAllModalsThen(async () => {
     // ดึง list นักเรียน + status ปัจจุบัน
     const rows = document.querySelectorAll('.bulk-row');
@@ -3421,7 +3421,7 @@ async function bulkSetAll(status, onlyUnset){
 }
 
 async function bulkClearAll(){
-  if(!confirm('ล้างการเช็คชื่อทั้งหมดของวันนี้+วิชานี้?\n(ลบทุก record ของวันนี้ คืนค่าเป็น "ยังไม่เช็ค")')) return;
+  if(!await confirmDialog('ล้างการเช็คชื่อทั้งหมดของวันนี้+วิชานี้?\n(ลบทุก record ของวันนี้ คืนค่าเป็น "ยังไม่เช็ค")')) return;
   closeAllModalsThen(async () => {
     const { error } = await sb.from('attendance').delete()
       .eq('subject_id', bulkAttState.subjectId)
@@ -5085,6 +5085,36 @@ function showModal({ title, body, onSave, saveText='บันทึก' }){
 function closeModal(bg){
   bg.style.animation = 'fadeIn 0.2s reverse';
   setTimeout(() => bg.remove(), 180);
+}
+
+// confirm() แบบ modal เข้าธีมแอป — คืน Promise<boolean>
+// รับได้ทั้ง string (ข้อความ) หรือ { title, message, confirmText, danger }
+function confirmDialog(opts){
+  if(typeof opts === 'string') opts = { message: opts };
+  const { title = 'ยืนยัน', message = '', confirmText = 'ตกลง', danger = true } = (opts || {});
+  return new Promise((resolve) => {
+    const bg = document.createElement('div');
+    bg.className = 'modal-bg';
+    const msgHtml = String(message).split('\n').map(line =>
+      line.trim() === '' ? '<div style="height:6px"></div>' : `<div>${escapeHtml(line)}</div>`
+    ).join('');
+    bg.innerHTML = `
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-handle"></div>
+        <div class="modal-title">${escapeHtml(title)}</div>
+        <div id="modalBody" style="color:var(--t2);font-size:14px;line-height:1.6;">${msgHtml}</div>
+        <div class="modal-actions">
+          <button class="btn-sec" id="cdCancel">ยกเลิก</button>
+          <button class="${danger ? 'btn-danger' : 'btn-pri'}" id="cdOk" style="margin-top:0;">${escapeHtml(confirmText)}</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(bg);
+    const done = (val) => { closeModal(bg); resolve(val); };
+    bg.addEventListener('click', () => done(false));
+    bg.querySelector('#cdCancel').onclick = () => done(false);
+    bg.querySelector('#cdOk').onclick = () => done(true);
+  });
 }
 
 // ====== SERVICE WORKER (PWA) ======
