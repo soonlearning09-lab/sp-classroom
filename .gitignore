@@ -1,0 +1,14 @@
+node_modules
+dist
+.env
+*.local
+
+# Supabase CLI local state
+.branches
+.temp
+supabase/.temp
+supabase/.branches
+
+# DB backups (อย่า commit ข้อมูลนักเรียนขึ้น public repo)
+backup_*.sql
+data_*.sql

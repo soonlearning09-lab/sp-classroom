@@ -1,7 +1,9 @@
 // SP - CLASSROOM Service Worker
 // เปลี่ยน version เมื่อ deploy ใหม่ — เพื่อให้ user ได้ไฟล์ใหม่
-const CACHE = 'sp-classroom-v10';
+const CACHE = 'sp-classroom-v11';
 
+// app shell แบบ relative (resolve ตาม scope ของ SW = base path /sp-classroom/)
+// ไฟล์ JS/CSS ที่ Vite build มี hash ในชื่อ → ไม่ list ที่นี่ แต่ runtime-cache ตอน fetch ครั้งแรก
 const APP_SHELL = [
   './',
   './index.html',
@@ -54,11 +56,14 @@ self.addEventListener('fetch', (event) => {
     caches.match(req).then(cached => {
       if (cached) return cached;
       return fetch(req).then(res => {
-        // Cache external CDN responses (only successful ones)
+        // cache ได้เมื่อ response ปกติ (ok) และเป็น:
+        //   - same-origin (รวม Vite hashed assets → ทำให้ offline ใช้ได้)
+        //   - CDN ที่อนุญาต (fonts)
+        const isSameOrigin = url.origin === self.location.origin;
         const isCdn = url.hostname.includes('jsdelivr.net')
                    || url.hostname.includes('googleapis.com')
                    || url.hostname.includes('gstatic.com');
-        if (res.ok && isCdn) {
+        if (res.ok && (isSameOrigin || isCdn)) {
           const clone = res.clone();
           caches.open(CACHE).then(c => c.put(req, clone));
         }

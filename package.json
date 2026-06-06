@@ -1,0 +1,19 @@
+{
+  "name": "sp-classroom",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SP - CLASSROOM ระบบติดตามผลการเรียน (PWA + Supabase)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "sortablejs": "^1.15.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

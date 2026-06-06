@@ -1,0 +1,5320 @@
+import './style.css';
+import { createClient } from '@supabase/supabase-js';
+import Sortable from 'sortablejs';
+
+// Supabase client (config มาจาก .env → import.meta.env, ดู .env.example)
+const sb = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY
+);
+
+// ====== CONFIG ======
+
+// ====== STATE ======
+let currentUser = null;
+let currentProfile = null;
+let subjectsCache = []; // [{id,name,color,icon,...}]
+let tracksCache = []; // cached tracks for dropdowns
+let currentTab = 'curriculum'; // current bottom tab
+let navStack = []; // navigation history เช่น [{view:'tracks'}, {view:'subjects', trackId}, ...]
+let showDeleted = false; // toggle ดู soft-deleted
+let itemFilter = 'all'; // all | lesson | assignment | exam
+let studentSearch = ''; // search keyword สำหรับนักเรียน
+let pendingCount = 0; // จำนวน pending users
+
+// ====== UTILS ======
+const $ = id => document.getElementById(id);
+function show(id){ $(id).classList.remove('hidden'); }
+function hide(id){ $(id).classList.add('hidden'); }
+function toast(msg, type=''){
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + type;
+  setTimeout(()=>{ t.className = 'toast ' + type; }, 2500);
+}
+function escapeHtml(s){
+  if(s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtDate(d){
+  if(!d) return '';
+  const dt = new Date(d);
+  return dt.toLocaleDateString('th-TH', { day:'numeric', month:'short', year:'numeric' });
+}
+function fmtDateInput(d){
+  if(!d) return '';
+  const dt = new Date(d);
+  const yr = dt.getFullYear();
+  const mo = String(dt.getMonth()+1).padStart(2,'0');
+  const dy = String(dt.getDate()).padStart(2,'0');
+  return `${yr}-${mo}-${dy}`;
+}
+
+// format dd/mm/yyyy (ปี ค.ศ.)
+function fmtDateDM(d){
+  if(!d) return '';
+  const dt = (d instanceof Date) ? d : new Date(d);
+  const yr = dt.getFullYear();
+  const mo = String(dt.getMonth()+1).padStart(2,'0');
+  const dy = String(dt.getDate()).padStart(2,'0');
+  return `${dy}/${mo}/${yr}`;
+}
+window.fmtDateDM = fmtDateDM;
+
+// =====  CUSTOM DATE PICKER =====
+// แสดงปุ่มที่กดแล้วเปิด modal เลือกวัน/เดือน/ปี
+// usage: <button class="date-picker-btn" onclick="openDatePicker('inputId', 'placeholder', minDate)">...</button>
+// + hidden input id="inputId" สำหรับเก็บค่า yyyy-mm-dd
+function renderDatePickerBtn(inputId, currentValue, placeholder='เลือกวันที่', minDateStr=null){
+  const minAttr = minDateStr ? `min="${minDateStr}"` : '';
+  const val = currentValue || '';
+  return `<input type="date" id="${inputId}" class="date-input" value="${val}" ${minAttr}
+    onchange="onDatePickerChange('${inputId}')">`;
+}
+
+function onDatePickerChange(inputId){
+  const el = document.getElementById(inputId);
+  if(!el) return;
+  const cb = window.__datePickerCallbacks?.[inputId];
+  if(cb) cb(el.value);
+}
+
+function openDatePickerFor(inputId, placeholder){
+  const hidden = document.getElementById(inputId);
+  if(!hidden) return;
+  const minDateStr = hidden.dataset.min || null;
+  let current = hidden.value || fmtDateInput(new Date());
+  const [yr, mo, dy] = current.split('-').map(n => parseInt(n, 10));
+
+  // หา onchange callback ผ่าน window.__datePickerCallbacks (สำหรับ propagate change)
+  const cb = window.__datePickerCallbacks?.[inputId];
+
+  const thaiMonths = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+
+  // year range: 5 ปีย้อนหลัง - 5 ปีข้างหน้า
+  const curYear = new Date().getFullYear();
+  const years = [];
+  for(let y = curYear - 5; y <= curYear + 5; y++) years.push(y);
+
+  showModal({
+    title: 'เลือกวันที่',
+    body: `
+      <div class="date-picker-grid">
+        <select id="dp_day">
+          ${Array.from({length:31}, (_,i) => i+1).map(d => `<option value="${d}" ${d===dy?'selected':''}>${d}</option>`).join('')}
+        </select>
+        <select id="dp_month">
+          ${thaiMonths.map((m, i) => `<option value="${i+1}" ${(i+1)===mo?'selected':''}>${m}</option>`).join('')}
+        </select>
+        <select id="dp_year">
+          ${years.map(y => `<option value="${y}" ${y===yr?'selected':''}>${y + 543}</option>`).join('')}
+        </select>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+        <button class="btn-tiny" onclick="dpSetToday('${inputId}')">วันนี้</button>
+        <button class="btn-tiny" onclick="dpClear('${inputId}')">ล้าง</button>
+      </div>
+    `,
+    saveText: 'ตกลง',
+    onSave: () => {
+      const d = parseInt($('dp_day').value, 10);
+      const m = parseInt($('dp_month').value, 10);
+      const y = parseInt($('dp_year').value, 10);
+      // ตรวจ validity (เช่น 31 ก.พ.)
+      const dt = new Date(y, m-1, d);
+      if(dt.getMonth() !== m-1){
+        toast('วันที่ไม่ถูกต้อง', 'error');
+        return false;
+      }
+      const newVal = `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      // ตรวจ min
+      if(minDateStr && newVal < minDateStr){
+        toast('วันที่ต้องไม่ก่อน ' + fmtDateDM(minDateStr), 'error');
+        return false;
+      }
+      hidden.value = newVal;
+      updateDatePickerBtn(inputId, placeholder);
+      if(typeof cb === 'function') cb(newVal);
+      return true;
+    }
+  });
+}
+
+function dpSetToday(inputId){
+  const today = fmtDateInput(new Date());
+  document.getElementById(inputId).value = today;
+  updateDatePickerBtn(inputId);
+  closeAllModalsThen(() => {
+    const cb = window.__datePickerCallbacks?.[inputId];
+    if(typeof cb === 'function') cb(today);
+  });
+}
+
+function dpClear(inputId){
+  document.getElementById(inputId).value = '';
+  updateDatePickerBtn(inputId);
+  closeAllModalsThen(() => {
+    const cb = window.__datePickerCallbacks?.[inputId];
+    if(typeof cb === 'function') cb('');
+  });
+}
+
+function updateDatePickerBtn(inputId, placeholder='เลือกวันที่'){
+  const btn = document.getElementById(inputId + '_btn');
+  const hidden = document.getElementById(inputId);
+  if(!btn || !hidden) return;
+  const label = btn.querySelector('.dp-label');
+  if(!label) return;
+  if(hidden.value){
+    label.textContent = fmtDateDM(hidden.value);
+    btn.classList.remove('placeholder');
+  } else {
+    label.textContent = placeholder;
+    btn.classList.add('placeholder');
+  }
+}
+
+// register callback (ใช้ใน places ที่ต้อง trigger เมื่อ value เปลี่ยน เช่น bulk attendance date)
+function registerDatePickerCallback(inputId, cb){
+  if(!window.__datePickerCallbacks) window.__datePickerCallbacks = {};
+  window.__datePickerCallbacks[inputId] = cb;
+}
+
+// ====== AUTH UI ======
+function showLogin(){ hide('registerForm'); hide('pendingForm'); show('loginForm'); }
+function showRegister(){ hide('loginForm'); hide('pendingForm'); show('registerForm'); }
+function showPending(email){
+  hide('loginForm'); hide('registerForm'); show('pendingForm');
+  $('pendingEmail').textContent = email;
+}
+
+// ====== AUTH ACTIONS ======
+async function doLogin(){
+  const email = $('loginEmail').value.trim();
+  const password = $('loginPassword').value;
+  if(!email || !password){ toast('กรุณากรอกอีเมลและรหัสผ่าน', 'error'); return; }
+  const btn = $('loginBtn');
+  btn.disabled = true; btn.textContent = 'กำลังเข้าสู่ระบบ...';
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  btn.disabled = false; btn.textContent = 'เข้าสู่ระบบ';
+  if(error){
+    toast(error.message.includes('Invalid') ? 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' : error.message, 'error');
+    return;
+  }
+  await routeUser();
+}
+
+async function doRegister(){
+  const name = $('regName').value.trim();
+  const email = $('regEmail').value.trim();
+  const password = $('regPassword').value;
+  if(!name || !email || !password){ toast('กรุณากรอกข้อมูลให้ครบ', 'error'); return; }
+  if(password.length < 6){ toast('รหัสผ่านต้องมีอย่างน้อย 6 ตัว', 'error'); return; }
+  const btn = $('regBtn');
+  btn.disabled = true; btn.textContent = 'กำลังลงทะเบียน...';
+  const { data, error } = await sb.auth.signUp({
+    email, password,
+    options: { data: { display_name: name } }
+  });
+  btn.disabled = false; btn.textContent = 'ลงทะเบียน';
+  if(error){ toast(error.message, 'error'); return; }
+  if(data.user){
+    await sb.from('profiles').update({ display_name: name }).eq('id', data.user.id);
+  }
+  toast('ลงทะเบียนสำเร็จ! รอผู้ดูแลอนุมัติ', 'success');
+  setTimeout(()=> showPending(email), 800);
+}
+
+async function doLogout(){
+  stopRealtimeBell();
+  await sb.auth.signOut();
+  currentUser = null; currentProfile = null;
+  subjectsCache = []; navStack = [];
+  history.replaceState(null, '', location.pathname);
+  $('loginEmail').value = ''; $('loginPassword').value = '';
+  hide('appPage'); show('authPage'); showLogin();
+}
+
+// ====== ROUTING ======
+async function routeUser(){
+  const { data: { user } } = await sb.auth.getUser();
+  if(!user){ hide('appPage'); show('authPage'); showLogin(); return; }
+  currentUser = user;
+  const { data: profile, error } = await sb.from('profiles').select('*').eq('id', user.id).single();
+  if(error || !profile){ toast('ไม่พบข้อมูลผู้ใช้', 'error'); await doLogout(); return; }
+  currentProfile = profile;
+  if(profile.role === 'pending' || !profile.approved){
+    hide('appPage'); show('authPage'); showPending(profile.email);
+    return;
+  }
+  // load subjects cache
+  await loadSubjects();
+  await loadTracksCache();
+  if(currentProfile.role === 'admin'){
+    await refreshPendingCount();
+    startRealtimeBell();
+  }
+  hide('authPage'); show('appPage');
+  renderApp();
+}
+
+async function loadSubjects(){
+  const { data } = await sb.from('subjects').select('*').order('order_index');
+  subjectsCache = data || [];
+}
+
+async function loadTracksCache(){
+  const { data } = await sb.from('tracks').select('*').is('deleted_at', null).order('created_at');
+  tracksCache = data || [];
+}
+
+async function refreshPendingCount(){
+  const { count } = await sb.from('profiles').select('*', {count:'exact', head:true})
+    .eq('approved', false).eq('role', 'pending');
+  pendingCount = count || 0;
+  const bell = $('bellBtn');
+  const badge = $('bellBadge');
+  if(currentProfile.role === 'admin'){
+    bell.classList.remove('hidden');
+    if(pendingCount > 0){
+      badge.classList.remove('hidden');
+      badge.textContent = pendingCount > 9 ? '9+' : pendingCount;
+    } else {
+      badge.classList.add('hidden');
+    }
+  } else {
+    bell.classList.add('hidden');
+  }
+}
+
+// ====== APP RENDER ======
+function renderApp(){
+  // role badge
+  const rb = $('roleBadge');
+  rb.textContent = currentProfile.role;
+  rb.className = 'role-badge role-' + currentProfile.role;
+  // render tab bar
+  renderTabBar();
+  // ลอง restore state จาก URL hash (กรณี refresh)
+  if(restoreNavState()){
+    // highlight tab ที่ถูก restore
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.tab === currentTab);
+    });
+    renderCurrentView();
+    return;
+  }
+  // initial tab
+  if(currentProfile.role === 'admin'){
+    switchTab('curriculum');
+  } else if(currentProfile.role === 'viewer'){
+    switchTab('tracking');
+  } else {
+    switchTab('stu-home');
+  }
+}
+
+function renderTabBar(){
+  const tb = $('tabbar');
+  let tabs = [];
+  if(currentProfile.role === 'admin'){
+    tabs = [
+      {key:'curriculum', icon:'📚', label:'หลักสูตร'},
+      {key:'students',   icon:'👥', label:'นักเรียน'},
+      {key:'tracking',   icon:'✅', label:'ติดตาม'},
+      {key:'attendance', icon:'📅', label:'เช็คชื่อ'},
+      {key:'dashboard',  icon:'📊', label:'สรุป'},
+    ];
+  } else if(currentProfile.role === 'viewer'){
+    tabs = [
+      {key:'viewer-home', icon:'👁️', label:'ภาพรวม'},
+      {key:'tracking',    icon:'✅', label:'ติดตาม'},
+      {key:'attendance',  icon:'📅', label:'เช็คชื่อ'},
+      {key:'dashboard',   icon:'📊', label:'สรุป'},
+    ];
+  } else {
+    tabs = [
+      {key:'stu-home',     icon:'🏠', label:'หน้าหลัก'},
+      {key:'stu-learn',    icon:'📚', label:'เรียน'},
+      {key:'stu-att',      icon:'📅', label:'เช็คชื่อ'},
+      {key:'stu-scores',   icon:'📊', label:'คะแนน'},
+    ];
+  }
+  tb.innerHTML = tabs.map(t =>
+    `<button class="tab-btn" data-tab="${t.key}" onclick="switchTab('${t.key}')">
+       <div class="tab-icon">${t.icon}</div>
+       <div class="tab-label">${t.label}</div>
+     </button>`
+  ).join('');
+}
+
+function switchTab(tabKey){
+  currentTab = tabKey;
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === tabKey);
+  });
+  navStack = [];
+  showDeleted = false;
+  itemFilter = 'all';
+  clearStudentDetailCache();
+  saveNavState();
+  renderCurrentView();
+}
+
+// ====== NAVIGATION ======
+function pushNav(view){
+  navStack.push(view);
+  showDeleted = false;
+  itemFilter = 'all';
+  saveNavState();
+  renderCurrentView();
+}
+function goBack(){
+  navStack.pop();
+  showDeleted = false;
+  itemFilter = 'all';
+  // เคลียร์ cache ถ้าไม่ได้อยู่ใน student-detail แล้ว
+  const top = navStack[navStack.length-1];
+  if(!top || top.view !== 'student-detail') clearStudentDetailCache();
+  saveNavState();
+  renderCurrentView();
+}
+
+// ===== Save / Restore nav state ผ่าน URL hash =====
+function saveNavState(){
+  if(!currentProfile) return;
+  const state = { 
+    tab: currentTab, 
+    stack: navStack,
+    detailTab: studentDetailTab
+  };
+  try {
+    const hash = '#' + btoa(unescape(encodeURIComponent(JSON.stringify(state))));
+    history.replaceState(null, '', hash);
+  } catch(e){}
+}
+
+function restoreNavState(){
+  if(!location.hash || location.hash.length < 2) return false;
+  try {
+    const state = JSON.parse(decodeURIComponent(escape(atob(location.hash.slice(1)))));
+    if(state.tab && Array.isArray(state.stack)){
+      const validTabs = {
+        admin: ['curriculum','students','tracking','attendance','dashboard','pending-users'],
+        viewer: ['viewer-home','tracking','attendance','dashboard'],
+        student: ['stu-home','stu-learn','stu-att','stu-scores']
+      };
+      const allowed = validTabs[currentProfile.role] || [];
+      if(!allowed.includes(state.tab)) return false;
+      currentTab = state.tab;
+      navStack = state.stack;
+      if(state.detailTab) studentDetailTab = state.detailTab;
+      return true;
+    }
+  } catch(e){}
+  return false;
+}
+function renderCurrentView(){
+  // ตัดสินใจว่าจะ render อะไรตาม tab+navStack
+  if(currentTab === 'curriculum'){
+    renderCurriculum();
+  } else if(currentTab === 'students'){
+    renderStudents();
+  } else if(currentTab === 'tracking'){
+    renderTracking();
+  } else if(currentTab === 'attendance'){
+    renderBulkAttendance();
+  } else if(currentTab === 'dashboard'){
+    renderDashboard();
+  } else if(currentTab === 'viewer-home'){
+    renderPlaceholder('👁️', 'หน้าผู้ดู', 'จะแสดงภาพรวมความคืบหน้าของนักเรียนทุกคน');
+  } else if(currentTab === 'stu-home'){
+    renderStudentHome();
+  } else if(currentTab === 'stu-learn'){
+    renderStudentLearn();
+  } else if(currentTab === 'stu-att'){
+    renderStudentAttendance();
+  } else if(currentTab === 'stu-scores'){
+    renderStudentScores();
+  } else if(currentTab === 'pending-users'){
+    renderPendingUsersList();
+  }
+}
+
+function renderPlaceholder(icon, title, text){
+  hide('breadcrumb'); hide('backBtn'); hide('fab');
+  show('topbarLogo'); hide('topbarTitle');
+  $('content').innerHTML = `
+    <div class="placeholder">
+      <div class="placeholder-icon">${icon}</div>
+      <div class="placeholder-title">${title}</div>
+      <div class="placeholder-text">${text}</div>
+      <div class="user-info">
+        <div class="user-info-row"><span>อีเมล</span><span>${escapeHtml(currentProfile.email)}</span></div>
+        <div class="user-info-row"><span>ชื่อแสดง</span><span>${escapeHtml(currentProfile.display_name || '-')}</span></div>
+        <div class="user-info-row"><span>สิทธิ์</span><span>${currentProfile.role}</span></div>
+      </div>
+      <div class="subj-preview">
+        ${subjectsCache.map(s => `<span class="subj-chip" style="background:${s.color}">${s.icon} ${escapeHtml(s.name)}</span>`).join('')}
+      </div>
+    </div>
+  `;
+}
+
+// ====================================================
+// ====== CURRICULUM MANAGEMENT (Task 3) ===============
+// ====================================================
+
+function renderCurriculum(){
+  const isAdmin = currentProfile.role === 'admin';
+  const view = navStack[navStack.length-1];
+
+  if(!view){
+    // หน้าหลัก: เลือก Subject ตรง ๆ (ไม่ผ่าน track แล้ว)
+    hide('backBtn'); show('topbarLogo'); hide('topbarTitle');
+    hide('breadcrumb');
+    if(isAdmin) show('fab'); else hide('fab');
+    renderSubjectsPageHome();
+    return;
+  }
+
+  show('backBtn'); hide('topbarLogo'); show('topbarTitle');
+  if(view.view === 'tracks-list'){
+    $('topbarTitle').textContent = 'Tracks (สายเรียน)';
+    hide('breadcrumb');
+    if(isAdmin) show('fab'); else hide('fab');
+    renderTracksList();
+  } else if(view.view === 'chapters'){
+    $('topbarTitle').textContent = view.subjectName;
+    renderBreadcrumb([view.subjectName]);
+    if(isAdmin) show('fab'); else hide('fab');
+    renderChaptersList(view);
+  } else if(view.view === 'topics'){
+    $('topbarTitle').textContent = view.chapterName;
+    renderBreadcrumb([view.subjectName, view.chapterName]);
+    if(isAdmin) show('fab'); else hide('fab');
+    renderTopicsList(view);
+  } else if(view.view === 'items'){
+    $('topbarTitle').textContent = view.topicName;
+    renderBreadcrumb([view.subjectName, view.chapterName, view.topicName]);
+    if(isAdmin) show('fab'); else hide('fab');
+    renderItemsList(view);
+  }
+}
+
+async function renderSubjectsPageHome(){
+  // นับ chapter ในแต่ละ subject
+  const { data: chapters } = await sb.from('chapters').select('subject_id').is('deleted_at', null);
+  const counts = {};
+  (chapters || []).forEach(c => { counts[c.subject_id] = (counts[c.subject_id] || 0) + 1; });
+
+  // เพิ่ม link ไปจัดการ Tracks ที่ด้านบน
+  const isAdmin = currentProfile.role === 'admin';
+  let html = '';
+  if(isAdmin){
+    html += `<div style="margin-bottom:14px;">
+      <button class="btn-outline" style="width:100%;padding:12px;font-size:14px;" onclick="openTracksList()">
+        🎓 จัดการ Track (สายเรียน)
+      </button>
+    </div>`;
+  }
+  html += '<div class="subj-grid" id="subjectsList">';
+  for(const s of subjectsCache){
+    const dragBtn = isAdmin
+      ? `<div class="drag-handle subj-tile-drag" onclick="event.stopPropagation()" title="ลากเพื่อเรียงลำดับ">⠿</div>`
+      : '';
+    const editBtn = isAdmin
+      ? `<button class="subj-tile-edit" onclick="event.stopPropagation(); editSubjectById('${s.id}')" title="แก้ไข">✏️</button>`
+      : '';
+    html += `
+      <div class="subj-tile" data-id="${s.id}" style="border-left-color:${s.color}" onclick="openSubject('${s.id}', \`${escapeHtml(s.name).replace(/`/g,'\\`')}\`)">
+        ${dragBtn}
+        ${editBtn}
+        <div class="subj-tile-icon">${s.icon}</div>
+        <div class="subj-tile-name">${escapeHtml(s.name)}</div>
+        <div class="subj-tile-count">${counts[s.id] || 0} บท</div>
+      </div>`;
+  }
+  html += '</div>';
+  $('content').innerHTML = html;
+
+  if(isAdmin){
+    setupSortable('subjectsList', 'subjects');
+  }
+}
+
+function openSubject(subjectId, subjectName){
+  pushNav({ view:'chapters', subjectId, subjectName });
+}
+
+function editSubjectById(id){
+  const s = subjectsCache.find(x => x.id === id);
+  if(s) openSubjectModal(s);
+}
+
+// ---------- TRACKS (เปลี่ยนเป็น modal/sub-page) ----------
+async function openTracksList(){
+  pushNav({ view:'tracks-list' });
+}
+
+function renderBreadcrumb(parts){
+  const bc = $('breadcrumb');
+  bc.classList.remove('hidden');
+  // parts: array of strings - level: 0=tracks(home), 1=subjects, 2=chapters, 3=topics, 4=items
+  // กดส่วนใน breadcrumb (ยกเว้นตัวสุดท้าย) เพื่อ navigate กลับไป level นั้น
+  // นอกจาก "ทั้งหมด" (level 0) ที่กลับไป list tracks
+  bc.innerHTML = parts.map((p,i) => {
+    if(i === parts.length-1){
+      return `<span>${escapeHtml(p)}</span>`;
+    }
+    // level i+1 ใน navStack หมายถึง: navStack มี item 0..i (i+1 items)
+    // ถ้ากดที่ part i ต้องตัดให้ navStack เหลือ i items
+    return `<a onclick="jumpToBreadcrumb(${i+1})">${escapeHtml(p)}</a><i>›</i>`;
+  }).join('');
+}
+
+function jumpToBreadcrumb(targetLen){
+  // ตัด navStack ให้เหลือ targetLen items
+  navStack = navStack.slice(0, targetLen);
+  showDeleted = false;
+  itemFilter = 'all';
+  renderCurrentView();
+}
+
+// helper: render banner ที่แสดงสถานะ "ดูที่ลบ" และปุ่ม toggle
+function renderDeletedToggle(label){
+  const isAdmin = currentProfile.role === 'admin';
+  if(!isAdmin) return '';
+  if(showDeleted){
+    return `<div class="deleted-banner">
+      <span>🗑️ กำลังดู${label}ที่ลบไป</span>
+      <button onclick="toggleDeleted()">← กลับ</button>
+    </div>`;
+  }
+  return `<div style="margin-bottom:12px;text-align:right;">
+    <button class="btn-outline" style="font-size:12px;padding:6px 12px;" onclick="toggleDeleted()">🗑️ ดูที่ลบไป</button>
+  </div>`;
+}
+
+// ---------- TRACKS ----------
+async function renderTracksList(){
+  const isAdmin = currentProfile.role === 'admin';
+  let q = sb.from('tracks').select('*').order('created_at');
+  if(!showDeleted) q = q.is('deleted_at', null);
+  else q = q.not('deleted_at', 'is', null);
+  const { data: tracks, error } = await q;
+  if(error){ toast('โหลด track ไม่ได้: ' + error.message, 'error'); return; }
+
+  let html = renderDeletedToggle('Track');
+
+  if(!tracks || tracks.length === 0){
+    html += `<div class="list-empty">
+      <div class="list-empty-icon">📂</div>
+      <div class="list-empty-text">${showDeleted ? 'ไม่มี Track ที่ลบไป' : 'ยังไม่มี Track' + (isAdmin ? '\nกด + เพื่อเพิ่ม' : '')}</div>
+    </div>`;
+  } else {
+    html += '<div class="card-list" id="tracksList">';
+    for(const t of tracks){
+      html += `
+        <div class="item-card" data-id="${t.id}">
+          <div class="item-body" onclick="${showDeleted ? '' : `openTrack('${t.id}', \`${escapeHtml(t.name).replace(/`/g,'\\`')}\`)`}">
+            <div class="item-title">${escapeHtml(t.name)}</div>
+            ${t.description ? `<div class="item-meta">${escapeHtml(t.description)}</div>` : ''}
+          </div>
+          ${isAdmin ? `
+            <div class="item-actions">
+              ${showDeleted ? `
+                <button class="icon-btn" onclick="restoreItem2('tracks','${t.id}')" title="กู้คืน">↩️</button>
+              ` : `
+                <button class="icon-btn" onclick="editTrack('${t.id}')">✏️</button>
+                <button class="icon-btn danger" onclick="deleteTrack('${t.id}', \`${escapeHtml(t.name).replace(/`/g,'\\`')}\`)">🗑️</button>
+              `}
+            </div>
+          ` : ''}
+          ${showDeleted ? '' : '<div class="item-arrow">›</div>'}
+        </div>`;
+    }
+    html += '</div>';
+  }
+  $('content').innerHTML = html;
+}
+
+function openTrack(id, name){
+  pushNav({ view:'subjects', trackId:id, trackName:name });
+}
+
+async function editTrack(id){
+  const { data: t } = await sb.from('tracks').select('*').eq('id', id).single();
+  if(!t) return;
+  openTrackModal(t);
+}
+
+async function deleteTrack(id, name){
+  // นับสิ่งที่จะหายไป (chapters, topics, items, progress, exam_scores)
+  if(!confirm(`ต้องการลบ Track "${name}" หรือไม่?\n\n(เนื้อหาทั้งหมดใน Track นี้จะถูกซ่อน แต่ยังกู้คืนได้)`)) return;
+  const { error } = await sb.from('tracks').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  if(error){ toast('ลบไม่สำเร็จ: ' + error.message, 'error'); return; }
+  toast('ลบเรียบร้อย', 'success');
+  renderTracksList();
+}
+
+async function restoreItem2(tableName, id){
+  const { error } = await sb.from(tableName).update({ deleted_at: null }).eq('id', id);
+  if(error){ toast('กู้คืนไม่สำเร็จ: ' + error.message, 'error'); return; }
+  toast('กู้คืนเรียบร้อย', 'success');
+  renderCurrentView();
+}
+
+function toggleDeleted(){
+  showDeleted = !showDeleted;
+  renderCurrentView();
+}
+
+function openTrackModal(track){
+  const isEdit = !!track;
+  showModal({
+    title: isEdit ? 'แก้ไข Track' : 'เพิ่ม Track',
+    body: `
+      <div class="fg">
+        <label>ชื่อ Track *</label>
+        <input id="m_track_name" type="text" placeholder="เช่น ม.6 สายวิทย์ 2569" value="${escapeHtml(track?.name || '')}">
+      </div>
+      <div class="fg">
+        <label>คำอธิบาย (ไม่บังคับ)</label>
+        <textarea id="m_track_desc" placeholder="รายละเอียดเพิ่มเติม">${escapeHtml(track?.description || '')}</textarea>
+      </div>
+    `,
+    onSave: async () => {
+      const name = $('m_track_name').value.trim();
+      const desc = $('m_track_desc').value.trim();
+      if(!name){ toast('กรอกชื่อ Track', 'error'); return false; }
+      if(isEdit){
+        const { error } = await sb.from('tracks').update({ name, description: desc || null }).eq('id', track.id);
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('บันทึกเรียบร้อย', 'success');
+      } else {
+        const { error } = await sb.from('tracks').insert({ name, description: desc || null });
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('เพิ่ม Track เรียบร้อย', 'success');
+      }
+      renderTracksList();
+      return true;
+    }
+  });
+}
+
+function openSubjectModal(subject){
+  const isEdit = !!subject;
+  const defaultColors = ['#F59E0B', '#3B82F6', '#10B981', '#EF4444', '#8B5CF6', '#EC4899', '#06B6D4', '#F97316'];
+  const defaultColor = subject?.color || defaultColors[Math.floor(Math.random() * defaultColors.length)];
+  showModal({
+    title: isEdit ? 'แก้ไขวิชา' : 'เพิ่มวิชา',
+    body: `
+      <div class="fg">
+        <label>ชื่อวิชา *</label>
+        <input id="m_sub_name" type="text" placeholder="เช่น คณิตศาสตร์ 1" value="${escapeHtml(subject?.name || '')}">
+      </div>
+      <div class="fg">
+        <label>ไอคอน (emoji) *</label>
+        <input id="m_sub_icon" type="text" placeholder="เช่น 📐 🔬 🧪 🧬 📚" value="${escapeHtml(subject?.icon || '')}" maxlength="4">
+      </div>
+      <div class="fg">
+        <label>สี (เส้นซ้ายของ tile)</label>
+        <input id="m_sub_color" type="color" value="${defaultColor}" style="height:44px;width:80px;padding:0;border:1.5px solid var(--bd);border-radius:8px;cursor:pointer;background:transparent;">
+      </div>
+    `,
+    onSave: async () => {
+      const name = $('m_sub_name').value.trim();
+      const icon = $('m_sub_icon').value.trim();
+      const color = $('m_sub_color').value;
+      if(!name){ toast('กรอกชื่อวิชา', 'error'); return false; }
+      if(!icon){ toast('กรอก emoji ไอคอน', 'error'); return false; }
+      if(isEdit){
+        const { error } = await sb.from('subjects').update({ name, icon, color }).eq('id', subject.id);
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('บันทึกเรียบร้อย', 'success');
+      } else {
+        const { data: max } = await sb.from('subjects').select('order_index')
+          .order('order_index', {ascending:false}).limit(1);
+        const nextOrder = (max && max[0]) ? max[0].order_index + 1 : 0;
+        const { error } = await sb.from('subjects').insert({ name, icon, color, order_index: nextOrder });
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('เพิ่มวิชาเรียบร้อย', 'success');
+      }
+      await loadSubjects();
+      renderCurrentView();
+      return true;
+    }
+  });
+}
+
+// ---------- CHAPTERS ----------
+async function renderChaptersList(view){
+  const isAdmin = currentProfile.role === 'admin';
+  let q = sb.from('chapters').select('*')
+    .eq('subject_id', view.subjectId)
+    .order('order_index');
+  if(!showDeleted) q = q.is('deleted_at', null);
+  else q = q.not('deleted_at', 'is', null);
+  const { data: chapters, error } = await q;
+  if(error){ toast(error.message, 'error'); return; }
+
+  let html = renderDeletedToggle('บท');
+
+  if(!chapters || chapters.length === 0){
+    html += `<div class="list-empty">
+      <div class="list-empty-icon">📖</div>
+      <div class="list-empty-text">${showDeleted ? 'ไม่มีบทที่ลบไป' : 'ยังไม่มีบท' + (isAdmin ? '\nกด + เพื่อเพิ่ม' : '')}</div>
+    </div>`;
+    $('content').innerHTML = html;
+    return;
+  }
+
+  const subj = subjectsCache.find(s => s.id === view.subjectId);
+  html += '<div class="card-list" id="chaptersList">';
+  for(const c of chapters){
+    html += `
+      <div class="item-card" data-id="${c.id}">
+        ${isAdmin && !showDeleted ? '<div class="drag-handle">⋮⋮</div>' : ''}
+        <div class="item-body" onclick="${showDeleted ? '' : `openChapter('${c.id}', \`${escapeHtml(c.name).replace(/`/g,'\\`')}\`)`}">
+          <div class="item-title">${escapeHtml(c.name)}</div>
+          <div class="item-meta">
+            <span class="subj-tag" style="background:${subj.color}">${subj.icon} ${escapeHtml(subj.name)}</span>
+          </div>
+        </div>
+        ${isAdmin ? `
+          <div class="item-actions">
+            ${showDeleted ? `
+              <button class="icon-btn" onclick="restoreItem2('chapters','${c.id}')" title="กู้คืน">↩️</button>
+            ` : `
+              <button class="icon-btn" onclick="editChapter('${c.id}')">✏️</button>
+              <button class="icon-btn danger" onclick="deleteChapter('${c.id}', \`${escapeHtml(c.name).replace(/`/g,'\\`')}\`)">🗑️</button>
+            `}
+          </div>
+        ` : ''}
+        ${showDeleted ? '' : '<div class="item-arrow">›</div>'}
+      </div>`;
+  }
+  html += '</div>';
+  $('content').innerHTML = html;
+
+  if(isAdmin && !showDeleted){
+    setupSortable('chaptersList', 'chapters');
+  }
+}
+
+function openChapter(id, name){
+  const v = navStack[navStack.length-1];
+  pushNav({ view:'topics', subjectId:v.subjectId, subjectName:v.subjectName, chapterId:id, chapterName:name });
+}
+
+async function editChapter(id){
+  const { data: c } = await sb.from('chapters').select('*').eq('id', id).single();
+  if(!c) return;
+  openChapterModal(c);
+}
+
+async function deleteChapter(id, name){
+  if(!confirm(`ลบบท "${name}"?\n(เนื้อหาทั้งหมดในบทจะถูกซ่อน กู้คืนได้)`)) return;
+  const { error } = await sb.from('chapters').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  if(error){ toast(error.message, 'error'); return; }
+  toast('ลบเรียบร้อย', 'success');
+  renderCurrentView();
+}
+
+function openChapterModal(chapter){
+  const isEdit = !!chapter;
+  const v = navStack[navStack.length-1];
+  showModal({
+    title: isEdit ? 'แก้ไขบท' : 'เพิ่มบท',
+    body: `
+      <div class="fg">
+        <label>ชื่อบท *</label>
+        <input id="m_ch_name" type="text" placeholder="เช่น บทที่ 1 จำนวนจริง" value="${escapeHtml(chapter?.name || '')}">
+      </div>
+    `,
+    onSave: async () => {
+      const name = $('m_ch_name').value.trim();
+      if(!name){ toast('กรอกชื่อบท', 'error'); return false; }
+      if(isEdit){
+        const { error } = await sb.from('chapters').update({ name }).eq('id', chapter.id);
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('บันทึกเรียบร้อย', 'success');
+      } else {
+        const { data: max } = await sb.from('chapters').select('order_index')
+          .eq('subject_id', v.subjectId)
+          .is('deleted_at', null).order('order_index', {ascending:false}).limit(1);
+        const nextOrder = (max && max[0]) ? max[0].order_index + 1 : 0;
+        const { error } = await sb.from('chapters').insert({
+          name, subject_id: v.subjectId, order_index: nextOrder
+        });
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('เพิ่มบทเรียบร้อย', 'success');
+      }
+      renderCurrentView();
+      return true;
+    }
+  });
+}
+
+// ---------- TOPICS ----------
+async function renderTopicsList(view){
+  const isAdmin = currentProfile.role === 'admin';
+  let q = sb.from('topics').select('*')
+    .eq('chapter_id', view.chapterId).order('order_index');
+  if(!showDeleted) q = q.is('deleted_at', null);
+  else q = q.not('deleted_at', 'is', null);
+  const { data: topics, error } = await q;
+  if(error){ toast(error.message, 'error'); return; }
+
+  let html = renderDeletedToggle('หัวข้อ');
+
+  if(!topics || topics.length === 0){
+    html += `<div class="list-empty">
+      <div class="list-empty-icon">📝</div>
+      <div class="list-empty-text">${showDeleted ? 'ไม่มีหัวข้อที่ลบไป' : 'ยังไม่มีหัวข้อ' + (isAdmin ? '\nกด + เพื่อเพิ่ม' : '')}</div>
+    </div>`;
+    $('content').innerHTML = html;
+    return;
+  }
+
+  html += '<div class="card-list" id="topicsList">';
+  for(const t of topics){
+    const { count } = await sb.from('items').select('*', {count:'exact', head:true})
+      .eq('topic_id', t.id).is('deleted_at', null);
+    html += `
+      <div class="item-card" data-id="${t.id}">
+        ${isAdmin && !showDeleted ? '<div class="drag-handle">⋮⋮</div>' : ''}
+        <div class="item-body" onclick="${showDeleted ? '' : `openTopic('${t.id}', \`${escapeHtml(t.name).replace(/`/g,'\\`')}\`)`}">
+          <div class="item-title">${escapeHtml(t.name)}</div>
+          <div class="item-meta">${count || 0} รายการ</div>
+        </div>
+        ${isAdmin ? `
+          <div class="item-actions">
+            ${showDeleted ? `
+              <button class="icon-btn" onclick="restoreItem2('topics','${t.id}')" title="กู้คืน">↩️</button>
+            ` : `
+              <button class="icon-btn" onclick="editTopic('${t.id}')">✏️</button>
+              <button class="icon-btn danger" onclick="deleteTopic('${t.id}', \`${escapeHtml(t.name).replace(/`/g,'\\`')}\`)">🗑️</button>
+            `}
+          </div>
+        ` : ''}
+        ${showDeleted ? '' : '<div class="item-arrow">›</div>'}
+      </div>`;
+  }
+  html += '</div>';
+  $('content').innerHTML = html;
+
+  if(isAdmin && !showDeleted) setupSortable('topicsList', 'topics');
+}
+
+function openTopic(id, name){
+  const v = navStack[navStack.length-1];
+  pushNav({ view:'items', subjectId:v.subjectId, subjectName:v.subjectName, chapterId:v.chapterId, chapterName:v.chapterName, topicId:id, topicName:name });
+}
+
+async function editTopic(id){
+  const { data: t } = await sb.from('topics').select('*').eq('id', id).single();
+  if(!t) return;
+  openTopicModal(t);
+}
+
+async function deleteTopic(id, name){
+  if(!confirm(`ลบหัวข้อ "${name}"?`)) return;
+  const { error } = await sb.from('topics').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  if(error){ toast(error.message, 'error'); return; }
+  toast('ลบเรียบร้อย', 'success');
+  renderCurrentView();
+}
+
+function openTopicModal(topic){
+  const isEdit = !!topic;
+  const v = navStack[navStack.length-1];
+  showModal({
+    title: isEdit ? 'แก้ไขหัวข้อ' : 'เพิ่มหัวข้อ',
+    body: `
+      <div class="fg">
+        <label>ชื่อหัวข้อ *</label>
+        <input id="m_tp_name" type="text" placeholder="เช่น การแก้สมการ" value="${escapeHtml(topic?.name || '')}">
+      </div>
+    `,
+    onSave: async () => {
+      const name = $('m_tp_name').value.trim();
+      if(!name){ toast('กรอกชื่อหัวข้อ', 'error'); return false; }
+      if(isEdit){
+        const { error } = await sb.from('topics').update({ name }).eq('id', topic.id);
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('บันทึกเรียบร้อย', 'success');
+      } else {
+        const { data: max } = await sb.from('topics').select('order_index')
+          .eq('chapter_id', v.chapterId).is('deleted_at', null)
+          .order('order_index', {ascending:false}).limit(1);
+        const nextOrder = (max && max[0]) ? max[0].order_index + 1 : 0;
+        const { error } = await sb.from('topics').insert({
+          name, chapter_id: v.chapterId, order_index: nextOrder
+        });
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('เพิ่มหัวข้อเรียบร้อย', 'success');
+      }
+      renderCurrentView();
+      return true;
+    }
+  });
+}
+
+// ---------- ITEMS ----------
+
+async function renderItemsList(view){
+  const isAdmin = currentProfile.role === 'admin';
+  let q = sb.from('items').select('*').eq('topic_id', view.topicId)
+    .order('order_index');
+  if(!showDeleted) q = q.is('deleted_at', null);
+  else q = q.not('deleted_at', 'is', null);
+  const { data: items, error } = await q;
+  if(error){ toast(error.message, 'error'); return; }
+
+  let html = renderDeletedToggle('รายการ');
+
+  // count by type
+  const counts = { all:0, lesson:0, assignment:0, exam:0 };
+  (items || []).forEach(i => { counts.all++; counts[i.type]++; });
+
+  // filter chips (ไม่แสดงตอนดู deleted)
+  if(!showDeleted){
+    const chips = [
+      {key:'all', label:`ทั้งหมด (${counts.all})`},
+      {key:'lesson', label:`📖 เนื้อหา (${counts.lesson})`},
+      {key:'assignment', label:`📝 งาน (${counts.assignment})`},
+      {key:'exam', label:`📊 สอบ (${counts.exam})`},
+    ];
+    html += '<div class="filter-row">';
+    chips.forEach(c => {
+      html += `<button class="chip ${itemFilter === c.key ? 'active' : ''}" onclick="setItemFilter('${c.key}')">${c.label}</button>`;
+    });
+    html += '</div>';
+  }
+
+  const filtered = (items || []).filter(i => showDeleted || itemFilter === 'all' || i.type === itemFilter);
+
+  if(filtered.length === 0){
+    html += `<div class="list-empty">
+      <div class="list-empty-icon">📋</div>
+      <div class="list-empty-text">${showDeleted ? 'ไม่มีรายการที่ลบไป' : (counts.all === 0 ? 'ยังไม่มีรายการ' : 'ไม่มีรายการในหมวดนี้')}${isAdmin && counts.all === 0 && !showDeleted ? '\nกด + เพื่อเพิ่ม' : ''}</div>
+    </div>`;
+  } else {
+    html += '<div class="card-list" id="itemsList">';
+    for(const it of filtered){
+      const isLesson = it.type === 'lesson';
+      const isAssign = it.type === 'assignment';
+      const isExam = it.type === 'exam';
+      let badge = '';
+      if(isLesson) badge = `<span class="type-badge type-lesson">📖 เนื้อหา</span>`;
+      else if(isAssign){
+        const dl = it.deadline ? `กำหนดส่ง ${fmtDate(it.deadline)}` : 'ไม่มีกำหนดส่ง';
+        badge = `<span class="type-badge type-assign">📝 งาน · ${dl}</span>`;
+      } else if(isExam){
+        const ms = it.max_score != null ? `เต็ม ${it.max_score} คะแนน` : 'ยังไม่ตั้งคะแนน';
+        badge = `<span class="type-badge type-exam">📊 สอบ · ${ms}</span>`;
+      }
+      // ปุ่มเปิดลิงก์ (ทุกคนกดได้): YouTube สำหรับ lesson, Google Form สำหรับ exam
+      let linkBtn = '';
+      if(it.url && !showDeleted){
+        if(isLesson){
+          linkBtn = `<button class="icon-btn link-btn" onclick="openLinkUrl(event, ${JSON.stringify(it.url).replace(/"/g,'&quot;')})" title="ดูวิดิโอ">▶️</button>`;
+        } else if(isExam){
+          linkBtn = `<button class="icon-btn link-btn" onclick="openLinkUrl(event, ${JSON.stringify(it.url).replace(/"/g,'&quot;')})" title="ทำข้อสอบ">📝</button>`;
+        }
+      }
+      // ปุ่มไฟล์ส่ง (assignment เท่านั้น): student เห็นเสมอ, admin เห็นเสมอ
+      let fileBtn = '';
+      if(isAssign && !showDeleted){
+        const studentHasAccount = !isAdmin && currentProfile.student_id;
+        if(isAdmin || studentHasAccount){
+          fileBtn = `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openSubmissionsForItem('${it.id}')" title="ไฟล์ส่ง">📎</button>`;
+        }
+      }
+      const hasActions = linkBtn || fileBtn || isAdmin;
+      html += `
+        <div class="item-card" data-id="${it.id}">
+          ${isAdmin && itemFilter === 'all' && !showDeleted ? '<div class="drag-handle">⋮⋮</div>' : ''}
+          <div class="item-body">
+            <div class="item-meta" style="margin-bottom:4px;">${badge}</div>
+            <div class="item-title">${escapeHtml(it.title)}</div>
+          </div>
+          ${hasActions ? `
+            <div class="item-actions">
+              ${linkBtn}
+              ${fileBtn}
+              ${isAdmin ? (showDeleted ? `
+                <button class="icon-btn" onclick="restoreItem2('items','${it.id}')" title="กู้คืน">↩️</button>
+              ` : `
+                <button class="icon-btn" onclick="editItem('${it.id}')">✏️</button>
+                <button class="icon-btn danger" onclick="deleteItem('${it.id}', \`${escapeHtml(it.title).replace(/`/g,'\\`')}\`)">🗑️</button>
+              `) : ''}
+            </div>
+          ` : ''}
+        </div>`;
+    }
+    html += '</div>';
+  }
+  $('content').innerHTML = html;
+
+  // sortable เฉพาะเมื่อ filter = all และไม่ได้ดู deleted
+  if(isAdmin && itemFilter === 'all' && !showDeleted){
+    setupSortable('itemsList', 'items');
+  }
+}
+
+function setItemFilter(f){
+  itemFilter = f;
+  renderCurrentView();
+}
+
+function openLinkUrl(ev, url){
+  ev.stopPropagation();
+  if(!url) return;
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+async function editItem(id){
+  const { data: it } = await sb.from('items').select('*').eq('id', id).single();
+  if(!it) return;
+  openItemModal(it);
+}
+
+async function deleteItem(id, name){
+  if(!confirm(`ลบรายการ "${name}"?`)) return;
+  const { error } = await sb.from('items').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  if(error){ toast(error.message, 'error'); return; }
+  toast('ลบเรียบร้อย', 'success');
+  renderCurrentView();
+}
+
+// ====================================================
+// ====== SUBMISSIONS (File Upload สำหรับ Assignment) ==
+// ====================================================
+
+const MAX_FILES_PER_SUBMISSION = 10;
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+const ALLOWED_MIME = ['application/pdf', 'image/jpeg', 'image/png'];
+const ALLOWED_EXT = '.pdf,.jpg,.jpeg,.png';
+
+async function listSubmissions(itemId, studentId = null){
+  let q = sb.from('submissions').select('*').eq('item_id', itemId).order('uploaded_at');
+  if(studentId) q = q.eq('student_id', studentId);
+  const { data, error } = await q;
+  if(error){ console.error(error); return []; }
+  return data || [];
+}
+
+async function uploadSubmission(itemId, studentId, file){
+  const safeName = file.name.replace(/[^\w.\-]/g, '_');
+  const path = `${itemId}/${studentId}/${Date.now()}-${safeName}`;
+  const { error: upErr } = await sb.storage.from('submissions').upload(path, file, {
+    cacheControl: '3600', upsert: false
+  });
+  if(upErr) throw upErr;
+  const { error: dbErr } = await sb.from('submissions').insert({
+    item_id: itemId, student_id: studentId, file_path: path,
+    file_name: file.name, file_size: file.size, mime_type: file.type
+  });
+  if(dbErr){
+    // rollback uploaded file
+    await sb.storage.from('submissions').remove([path]);
+    throw dbErr;
+  }
+}
+
+async function deleteSubmission(submission){
+  // ลบ file ใน storage ก่อน (failed-silent ก็ยังไปต่อเพื่อให้ DB row หาย)
+  await sb.storage.from('submissions').remove([submission.file_path]);
+  const { error } = await sb.from('submissions').delete().eq('id', submission.id);
+  if(error) throw error;
+}
+
+async function downloadSubmission(submission){
+  const { data, error } = await sb.storage.from('submissions')
+    .createSignedUrl(submission.file_path, 3600);
+  if(error || !data){ toast('ไม่สามารถเปิดไฟล์ได้', 'error'); return; }
+  window.open(data.signedUrl, '_blank', 'noopener,noreferrer');
+}
+
+function fmtFileSize(bytes){
+  if(bytes < 1024) return bytes + ' B';
+  if(bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  return (bytes/(1024*1024)).toFixed(1) + ' MB';
+}
+
+function fileIcon(mime){
+  if(mime?.startsWith('image/')) return '🖼️';
+  if(mime === 'application/pdf') return '📄';
+  return '📎';
+}
+
+async function openSubmissionsModal(item, studentIdContext = null){
+  const isAdmin = currentProfile.role === 'admin';
+  // student → เปิดของตัวเองเท่านั้น
+  // admin in tracking → studentIdContext = student คนนั้น
+  // admin in curriculum → studentIdContext = null → ดูทุก student
+  const filterStudentId = isAdmin ? studentIdContext : currentProfile.student_id;
+
+  const subs = await listSubmissions(item.id, filterStudentId);
+
+  // ถ้า admin + filterStudentId null → ต้อง load student names
+  let studentsMap = {};
+  if(isAdmin && !filterStudentId){
+    const ids = [...new Set(subs.map(s => s.student_id))];
+    if(ids.length > 0){
+      const { data } = await sb.from('students').select('id, nickname').in('id', ids);
+      (data || []).forEach(s => { studentsMap[s.id] = s.nickname; });
+    }
+  }
+
+  // student → ดู count + ปุ่มเพิ่ม
+  const canUpload = !isAdmin && filterStudentId && subs.length < MAX_FILES_PER_SUBMISSION;
+  const myCount = subs.length; // จะตรงกับของตัวเอง (student) เสมอ
+
+  let bodyHtml = '';
+
+  // Upload section (student only)
+  if(!isAdmin){
+    bodyHtml += `
+      <div style="margin-bottom:16px;">
+        <div style="font-size:13px;color:var(--t2);margin-bottom:8px;">
+          ${myCount}/${MAX_FILES_PER_SUBMISSION} ไฟล์ · สูงสุด 5 MB/ไฟล์ · PDF/JPG/PNG
+        </div>
+        ${canUpload ? `
+          <input type="file" id="m_sub_files" accept="${ALLOWED_EXT}" multiple
+            style="display:none;" onchange="onSubmissionFilesPicked('${item.id}', '${filterStudentId}')">
+          <button class="btn-pri" style="width:100%;padding:12px;margin-top:0;" onclick="document.getElementById('m_sub_files').click()">
+            📎 เลือกไฟล์อัปโหลด
+          </button>
+        ` : (myCount >= MAX_FILES_PER_SUBMISSION ? `
+          <div style="padding:12px;background:#FEF3C7;color:#92400E;border-radius:8px;font-size:13px;text-align:center;">
+            ครบ ${MAX_FILES_PER_SUBMISSION} ไฟล์แล้ว — ลบของเก่าก่อนถ้าต้องการเพิ่ม
+          </div>
+        ` : '')}
+      </div>
+    `;
+  }
+
+  // List section
+  if(subs.length === 0){
+    bodyHtml += `
+      <div style="padding:24px;text-align:center;color:var(--t3);font-size:13px;">
+        ยังไม่มีไฟล์
+      </div>
+    `;
+  } else {
+    bodyHtml += '<div id="submissionsList">';
+    // ถ้า admin + ดูทุก student → group by student
+    if(isAdmin && !filterStudentId){
+      const byStudent = {};
+      subs.forEach(s => { (byStudent[s.student_id] = byStudent[s.student_id] || []).push(s); });
+      for(const sid of Object.keys(byStudent)){
+        bodyHtml += `<div style="font-weight:700;font-size:13px;color:var(--t2);margin:8px 0 4px;">
+          ${escapeHtml(studentsMap[sid] || 'ไม่ทราบชื่อ')} (${byStudent[sid].length})
+        </div>`;
+        bodyHtml += byStudent[sid].map(s => renderSubmissionRow(s, isAdmin, !isAdmin)).join('');
+      }
+    } else {
+      bodyHtml += subs.map(s => renderSubmissionRow(s, isAdmin, !isAdmin)).join('');
+    }
+    bodyHtml += '</div>';
+  }
+
+  showModal({
+    title: `📎 ไฟล์ส่ง: ${escapeHtml(item.title)}`,
+    body: bodyHtml,
+    onSave: null, // ไม่มีปุ่ม save — เป็น view/manage modal
+    saveText: ''
+  });
+}
+
+function renderSubmissionRow(s, canAdminDelete, canStudentDelete){
+  const deleteBtn = (canAdminDelete || canStudentDelete)
+    ? `<button class="icon-btn danger" onclick="confirmDeleteSubmission('${s.id}', \`${escapeHtml(s.file_name).replace(/`/g,'\\`')}\`)" title="ลบ">🗑️</button>`
+    : '';
+  return `
+    <div class="submission-row">
+      <div class="submission-icon">${fileIcon(s.mime_type)}</div>
+      <div class="submission-body" onclick='downloadSubmissionById("${s.id}")'>
+        <div class="submission-name">${escapeHtml(s.file_name)}</div>
+        <div class="submission-meta">${fmtFileSize(s.file_size || 0)} · ${fmtDate(s.uploaded_at)}</div>
+      </div>
+      ${deleteBtn}
+    </div>
+  `;
+}
+
+// helper ที่ row ใช้
+async function downloadSubmissionById(submissionId){
+  const { data } = await sb.from('submissions').select('*').eq('id', submissionId).single();
+  if(data) downloadSubmission(data);
+}
+
+async function confirmDeleteSubmission(submissionId, fileName){
+  if(!confirm(`ลบไฟล์ "${fileName}"?\n\nไฟล์จะถูกลบถาวรและกู้คืนไม่ได้`)) return;
+  const { data: sub } = await sb.from('submissions').select('*').eq('id', submissionId).single();
+  if(!sub){ toast('ไม่พบไฟล์', 'error'); return; }
+  try{
+    await deleteSubmission(sub);
+    toast('ลบไฟล์เรียบร้อย', 'success');
+    // refresh modal — close + reopen
+    document.querySelectorAll('.modal-bg').forEach(m => m.remove());
+    const { data: it } = await sb.from('items').select('*').eq('id', sub.item_id).single();
+    if(it){
+      // หา context: ถ้า admin in tracking ก็เปิดของ student คนนั้น, ถ้า student ก็ของตัวเอง
+      const sidCtx = (currentProfile.role === 'admin') ? sub.student_id : null;
+      // หา student in tracking from navStack
+      const v = navStack[navStack.length-1];
+      const fromTracking = currentTab === 'tracking' && v?.studentId;
+      openSubmissionsModal(it, fromTracking ? v.studentId : (currentProfile.role === 'admin' ? null : undefined));
+    }
+  } catch(err){
+    toast(err.message || 'ลบไม่สำเร็จ', 'error');
+  }
+}
+
+async function onSubmissionFilesPicked(itemId, studentId){
+  const input = $('m_sub_files');
+  const files = Array.from(input.files || []);
+  if(files.length === 0) return;
+
+  // check current count
+  const existing = await listSubmissions(itemId, studentId);
+  const remaining = MAX_FILES_PER_SUBMISSION - existing.length;
+  if(files.length > remaining){
+    toast(`เกินจำนวน — เพิ่มได้อีก ${remaining} ไฟล์เท่านั้น`, 'error');
+    input.value = '';
+    return;
+  }
+
+  // validate sizes + types
+  for(const f of files){
+    if(f.size > MAX_FILE_SIZE){
+      toast(`"${f.name}" เกิน 5 MB`, 'error');
+      input.value = '';
+      return;
+    }
+    if(!ALLOWED_MIME.includes(f.type)){
+      toast(`"${f.name}" ไม่ใช่ PDF/JPG/PNG`, 'error');
+      input.value = '';
+      return;
+    }
+  }
+
+  toast(`กำลังอัปโหลด ${files.length} ไฟล์...`, 'info');
+  let ok = 0, fail = 0;
+  for(const f of files){
+    try{
+      await uploadSubmission(itemId, studentId, f);
+      ok++;
+    } catch(err){
+      console.error(err);
+      fail++;
+    }
+  }
+  input.value = '';
+  toast(fail === 0 ? `อัปโหลด ${ok} ไฟล์เรียบร้อย` : `อัปโหลดสำเร็จ ${ok} ไฟล์ · ล้มเหลว ${fail}`, fail === 0 ? 'success' : 'error');
+
+  // refresh modal
+  document.querySelectorAll('.modal-bg').forEach(m => m.remove());
+  const { data: it } = await sb.from('items').select('*').eq('id', itemId).single();
+  if(it) openSubmissionsModal(it);
+}
+
+function openSubmissionsForItem(itemId, studentIdContext){
+  // fetch item แล้วเปิด modal
+  sb.from('items').select('*').eq('id', itemId).single().then(({data}) => {
+    if(data) openSubmissionsModal(data, studentIdContext || null);
+  });
+}
+
+function openItemModal(item){
+  const isEdit = !!item;
+  const v = navStack[navStack.length-1];
+  const initType = item?.type || 'lesson';
+  showModal({
+    title: isEdit ? 'แก้ไขรายการ' : 'เพิ่มรายการ',
+    body: `
+      <div class="fg">
+        <label>ประเภท *</label>
+        <select id="m_it_type" onchange="onItemTypeChange()">
+          <option value="lesson" ${initType==='lesson'?'selected':''}>📖 เนื้อหา</option>
+          <option value="assignment" ${initType==='assignment'?'selected':''}>📝 งาน (มี deadline)</option>
+          <option value="exam" ${initType==='exam'?'selected':''}>📊 สอบ (มีคะแนน)</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>ชื่อรายการ *</label>
+        <input id="m_it_title" type="text" placeholder="เช่น โจทย์ตัวอย่าง" value="${escapeHtml(item?.title || '')}">
+      </div>
+      <div class="fg ${initType==='lesson' ? '' : 'hidden'}" id="m_it_youtube_wrap">
+        <label>ลิงก์ YouTube (ถ้ามี)</label>
+        <input id="m_it_youtube" type="url" placeholder="https://youtu.be/..." value="${initType==='lesson' ? escapeHtml(item?.url || '') : ''}">
+      </div>
+      <div class="fg ${initType==='assignment' ? '' : 'hidden'}" id="m_it_deadline_wrap">
+        <label>กำหนดส่ง</label>
+        ${renderDatePickerBtn('m_it_deadline', item?.deadline ? fmtDateInput(item.deadline) : '', 'เลือกวันที่')}
+      </div>
+      <div class="fg ${initType==='exam' ? '' : 'hidden'}" id="m_it_score_wrap">
+        <label>คะแนนเต็ม</label>
+        <input id="m_it_score" type="number" min="0" step="0.5" placeholder="เช่น 20" value="${item?.max_score ?? ''}">
+      </div>
+      <div class="fg ${initType==='exam' ? '' : 'hidden'}" id="m_it_examform_wrap">
+        <label>ลิงก์ Google Form (ถ้ามี)</label>
+        <input id="m_it_examform" type="url" placeholder="https://docs.google.com/forms/..." value="${initType==='exam' ? escapeHtml(item?.url || '') : ''}">
+      </div>
+    `,
+    onSave: async () => {
+      const type = $('m_it_type').value;
+      const title = $('m_it_title').value.trim();
+      if(!title){ toast('กรอกชื่อรายการ', 'error'); return false; }
+      const payload = { type, title, deadline:null, max_score:null, url:null };
+      if(type === 'lesson'){
+        const yt = $('m_it_youtube').value.trim();
+        if(yt && !/^https?:\/\//i.test(yt)){ toast('ลิงก์ YouTube ต้องขึ้นต้นด้วย http:// หรือ https://', 'error'); return false; }
+        payload.url = yt || null;
+      } else if(type === 'assignment'){
+        const d = $('m_it_deadline').value;
+        payload.deadline = d ? new Date(d + 'T23:59:59').toISOString() : null;
+      } else if(type === 'exam'){
+        const s = $('m_it_score').value.trim();
+        if(s !== ''){
+          payload.max_score = parseFloat(s);
+          if(isNaN(payload.max_score) || payload.max_score < 0){ toast('คะแนนไม่ถูกต้อง', 'error'); return false; }
+        }
+        const fm = $('m_it_examform').value.trim();
+        if(fm && !/^https?:\/\//i.test(fm)){ toast('ลิงก์ Google Form ต้องขึ้นต้นด้วย http:// หรือ https://', 'error'); return false; }
+        payload.url = fm || null;
+      }
+      if(isEdit){
+        const { error } = await sb.from('items').update(payload).eq('id', item.id);
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('บันทึกเรียบร้อย', 'success');
+      } else {
+        const { data: max } = await sb.from('items').select('order_index')
+          .eq('topic_id', v.topicId).is('deleted_at', null)
+          .order('order_index', {ascending:false}).limit(1);
+        const nextOrder = (max && max[0]) ? max[0].order_index + 1 : 0;
+        const { error } = await sb.from('items').insert({
+          ...payload, topic_id: v.topicId, order_index: nextOrder
+        });
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('เพิ่มเรียบร้อย', 'success');
+      }
+      renderCurrentView();
+      return true;
+    }
+  });
+}
+
+function onItemTypeChange(){
+  const t = $('m_it_type').value;
+  $('m_it_youtube_wrap').classList.toggle('hidden', t !== 'lesson');
+  $('m_it_deadline_wrap').classList.toggle('hidden', t !== 'assignment');
+  $('m_it_score_wrap').classList.toggle('hidden', t !== 'exam');
+  $('m_it_examform_wrap').classList.toggle('hidden', t !== 'exam');
+}
+
+// ====================================================
+// ====== STUDENTS MANAGEMENT (Task 4) =================
+// ====================================================
+
+function renderStudents(){
+  const isAdmin = currentProfile.role === 'admin';
+  const view = navStack[navStack.length-1];
+
+  if(!view){
+    // หน้าหลัก: list students
+    hide('backBtn'); show('topbarLogo'); hide('topbarTitle');
+    hide('breadcrumb');
+    if(isAdmin) show('fab'); else hide('fab');
+    renderStudentsList();
+    return;
+  }
+
+  // detail view
+  show('backBtn'); hide('topbarLogo'); show('topbarTitle');
+  $('topbarTitle').textContent = view.studentName;
+  renderBreadcrumb([view.studentName]);
+  hide('fab');
+  renderStudentDetail(view);
+}
+
+async function renderStudentsList(){
+  const isAdmin = currentProfile.role === 'admin';
+  let q = sb.from('students').select('*, tracks(name)').order('created_at', {ascending:false});
+  if(!showDeleted) q = q.is('deleted_at', null);
+  else q = q.not('deleted_at', 'is', null);
+  const { data: students, error } = await q;
+  if(error){ toast(error.message, 'error'); return; }
+
+  // ดึง enrollment count ของแต่ละนักเรียน
+  const studentIds = (students || []).map(s => s.id);
+  let enrolls = {};
+  if(studentIds.length > 0){
+    const { data: enrollData } = await sb.from('enrollments').select('student_id')
+      .in('student_id', studentIds);
+    (enrollData || []).forEach(e => {
+      enrolls[e.student_id] = (enrolls[e.student_id] || 0) + 1;
+    });
+  }
+
+  // ดึง profile ที่ link กับนักเรียนแล้ว
+  let linkedProfiles = {};
+  if(studentIds.length > 0){
+    const { data: profs } = await sb.from('profiles').select('id, email, student_id')
+      .in('student_id', studentIds);
+    (profs || []).forEach(p => { linkedProfiles[p.student_id] = p; });
+  }
+
+  // filter by search
+  const filtered = (students || []).filter(s => {
+    if(!studentSearch) return true;
+    const q = studentSearch.toLowerCase();
+    return (s.nickname || '').toLowerCase().includes(q)
+        || (s.grade || '').toLowerCase().includes(q);
+  });
+
+  let html = '';
+  // search bar (ไม่ใส่ตอน showDeleted)
+  if(!showDeleted){
+    html += `<div class="search-bar">
+      <input class="search-input" type="text" placeholder="ค้นหานักเรียน..." 
+        value="${escapeHtml(studentSearch)}"
+        oninput="onStudentSearch(this.value)">
+    </div>`;
+  }
+  html += renderDeletedToggle('นักเรียน');
+
+  if(filtered.length === 0){
+    html += `<div class="list-empty">
+      <div class="list-empty-icon">👥</div>
+      <div class="list-empty-text">${
+        showDeleted ? 'ไม่มีนักเรียนที่ลบไป' :
+        (studentSearch ? 'ไม่พบนักเรียน' : 'ยังไม่มีนักเรียน' + (isAdmin ? '\nกด + เพื่อเพิ่ม' : ''))
+      }</div>
+    </div>`;
+  } else {
+    html += '<div class="card-list">';
+    for(const s of filtered){
+      const enrollCount = enrolls[s.id] || 0;
+      const trackName = s.tracks?.name || '';
+      const linked = linkedProfiles[s.id];
+      const initial = (s.nickname || '?').charAt(0).toUpperCase();
+      html += `
+        <div class="item-card" data-id="${s.id}">
+          <div class="avatar">${escapeHtml(initial)}</div>
+          <div class="item-body" onclick="${showDeleted ? '' : `openStudent('${s.id}', \`${escapeHtml(s.nickname).replace(/`/g,'\\`')}\`)`}">
+            <div class="item-title">${escapeHtml(s.nickname)}</div>
+            <div class="item-meta">
+              ${s.grade ? `<span>${escapeHtml(s.grade)}</span>` : ''}
+              ${trackName ? `<span>· ${escapeHtml(trackName)}</span>` : ''}
+              <span>· ${enrollCount} วิชา</span>
+              ${linked ? `<span class="linked-badge">🔗 มี account</span>` : ''}
+            </div>
+          </div>
+          ${isAdmin ? `
+            <div class="item-actions">
+              ${showDeleted ? `
+                <button class="icon-btn" onclick="restoreItem2('students','${s.id}')" title="กู้คืน">↩️</button>
+              ` : `
+                <button class="icon-btn danger" onclick="deleteStudent('${s.id}', \`${escapeHtml(s.nickname).replace(/`/g,'\\`')}\`)">🗑️</button>
+              `}
+            </div>
+          ` : ''}
+          ${showDeleted ? '' : '<div class="item-arrow">›</div>'}
+        </div>`;
+    }
+    html += '</div>';
+  }
+  $('content').innerHTML = html;
+}
+
+function onStudentSearch(v){
+  studentSearch = v;
+  // debounce ง่ายๆ: re-render เลย
+  renderStudentsList();
+}
+
+function openStudent(id, name){
+  pushNav({ view:'student-detail', studentId:id, studentName:name });
+}
+
+async function deleteStudent(id, name){
+  if(!confirm(`ลบนักเรียน "${name}"?\n(progress, คะแนน, การมาเรียนทั้งหมดจะถูกซ่อน กู้คืนได้)`)) return;
+  const { error } = await sb.from('students').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  if(error){ toast(error.message, 'error'); return; }
+  toast('ลบเรียบร้อย', 'success');
+  renderStudentsList();
+}
+
+// ---------- STUDENT DETAIL ----------
+let studentDetailTab = 'info'; // info | attendance
+let studentDetailCache = null; // cache data for current student
+
+async function renderStudentDetail(view){
+  // โหลดข้อมูลถ้ายังไม่ได้ cache หรือเปลี่ยนนักเรียน
+  if(!studentDetailCache || studentDetailCache.studentId !== view.studentId){
+    const { data: s, error } = await sb.from('students')
+      .select('*, tracks(id, name)').eq('id', view.studentId).single();
+    if(error || !s){ toast('ไม่พบข้อมูลนักเรียน', 'error'); goBack(); return; }
+
+    const { data: enrolls } = await sb.from('enrollments').select('subject_id')
+      .eq('student_id', view.studentId);
+    const enrolledIds = new Set((enrolls || []).map(e => e.subject_id));
+
+    const { data: profs } = await sb.from('profiles').select('id, email, display_name')
+      .eq('student_id', view.studentId);
+
+    studentDetailCache = {
+      studentId: view.studentId,
+      student: s,
+      enrolledIds,
+      enrolledSubjects: subjectsCache.filter(sub => enrolledIds.has(sub.id)),
+      linkedProfile: profs && profs[0]
+    };
+  }
+
+  // Render shell + tabs (เร็ว เพราะใช้ cache)
+  renderStudentDetailShell();
+
+  // Render content ตาม tab ปัจจุบัน
+  await renderStudentDetailContent();
+}
+
+function renderStudentDetailShell(){
+  const tabsHtml = `<div class="detail-tabs">
+    <div class="detail-tab ${studentDetailTab === 'info' ? 'active' : ''}" onclick="setStudentDetailTab('info')">📋 ข้อมูล</div>
+    <div class="detail-tab ${studentDetailTab === 'attendance' ? 'active' : ''}" onclick="setStudentDetailTab('attendance')">📅 เช็คชื่อ</div>
+  </div>
+  <div id="detail_content"></div>`;
+  $('content').innerHTML = tabsHtml;
+}
+
+async function renderStudentDetailContent(){
+  const isAdmin = currentProfile.role === 'admin';
+  const cache = studentDetailCache;
+  if(!cache) return;
+  const { student: s, enrolledIds, enrolledSubjects, linkedProfile } = cache;
+
+  let html = '';
+
+  if(studentDetailTab === 'info'){
+    // Section: ข้อมูลพื้นฐาน
+    html += `<div class="detail-section">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <div class="section-title" style="margin-bottom:0;">ข้อมูลพื้นฐาน</div>
+        ${isAdmin ? `<button class="btn-mini btn-mini-pri" onclick="editStudent('${s.id}')">✏️ แก้ไข</button>` : ''}
+      </div>
+      <div class="detail-row">
+        <span class="lbl">ชื่อเล่น</span>
+        <span class="val">${escapeHtml(s.nickname)}</span>
+      </div>
+      <div class="detail-row">
+        <span class="lbl">ชั้น</span>
+        <span class="val ${s.grade ? '' : 'muted'}">${escapeHtml(s.grade || 'ไม่ระบุ')}</span>
+      </div>
+      <div class="detail-row">
+        <span class="lbl">Track</span>
+        <span class="val ${s.tracks ? '' : 'muted'}">${s.tracks ? escapeHtml(s.tracks.name) : 'ไม่ระบุ'}</span>
+      </div>
+      ${s.note ? `<div class="detail-row">
+        <span class="lbl">หมายเหตุ</span>
+        <span class="val" style="max-width:60%;white-space:pre-wrap;">${escapeHtml(s.note)}</span>
+      </div>` : ''}
+    </div>`;
+
+    // Section: วิชาที่เรียน
+    html += `<div class="detail-section">
+      <div class="section-title">วิชาที่เรียน (${enrolledIds.size}/${subjectsCache.length})</div>
+      <div class="subj-check-grid">`;
+    for(const sub of subjectsCache){
+      const checked = enrolledIds.has(sub.id);
+      html += `
+        <div class="subj-check ${checked ? 'checked' : ''}" 
+          style="border-color:${checked ? sub.color : ''}"
+          ${isAdmin ? `onclick="toggleEnroll('${s.id}','${sub.id}',${!checked})"` : ''}>
+          <div class="subj-check-icon">${sub.icon}</div>
+          <div class="subj-check-name" style="${checked ? `color:${sub.color}` : ''}">${escapeHtml(sub.name)}</div>
+          <div class="subj-check-tick">✓</div>
+        </div>`;
+    }
+    html += `</div></div>`;
+
+    // Section: Account
+    if(isAdmin){
+      html += `<div class="detail-section">
+        <div class="section-title">บัญชี Login</div>`;
+      if(linkedProfile){
+        html += `<div class="detail-row">
+          <span class="lbl">อีเมล</span>
+          <span class="val">${escapeHtml(linkedProfile.email)}</span>
+        </div>
+        <button class="btn-mini btn-mini-danger" style="margin-top:10px;width:100%;padding:10px;" 
+          onclick="unlinkStudent('${linkedProfile.id}', \`${escapeHtml(s.nickname).replace(/`/g,'\\`')}\`)">
+          🔗 ยกเลิกการลิงก์
+        </button>`;
+      } else {
+        html += `<div style="font-size:13px;color:var(--t2);margin-bottom:10px;">
+          ยังไม่มีบัญชีลิงก์กับนักเรียนคนนี้
+        </div>
+        <button class="btn-mini btn-mini-pri" style="width:100%;padding:10px;" 
+          onclick="openLinkStudent('${s.id}', \`${escapeHtml(s.nickname).replace(/`/g,'\\`')}\`)">
+          🔗 ลิงก์บัญชี
+        </button>`;
+      }
+      html += `</div>`;
+    }
+  } else if(studentDetailTab === 'attendance'){
+    if(enrolledSubjects.length === 0){
+      html += `<div class="track-empty">นักเรียนยังไม่ได้เลือกวิชา<br>ไปที่แท็บ "ข้อมูล" เพื่อเลือกวิชา</div>`;
+    } else {
+      html += await renderAttendanceCalendar(s, enrolledSubjects);
+    }
+  }
+
+  const el = $('detail_content');
+  if(el) el.innerHTML = html;
+}
+
+function setStudentDetailTab(tab){
+  if(studentDetailTab === tab) return;
+  studentDetailTab = tab;
+  saveNavState();
+  // อัปเดตแค่ tab active + content (ไม่ต้องดึง DB ใหม่)
+  document.querySelectorAll('.detail-tab').forEach(t => {
+    t.classList.toggle('active', t.textContent.includes(tab === 'info' ? 'ข้อมูล' : 'เช็คชื่อ'));
+  });
+  renderStudentDetailContent();
+}
+
+// เคลียร์ cache เมื่อออกจาก student detail
+function clearStudentDetailCache(){
+  studentDetailCache = null;
+}
+
+async function toggleEnroll(studentId, subjectId, willEnroll){
+  // ===== Optimistic UI Update =====
+  const tile = document.querySelector(`.subj-check[onclick*="${subjectId}"][onclick*="${studentId}"]`);
+  if(tile){
+    const sub = subjectsCache.find(s => s.id === subjectId);
+    tile.classList.toggle('checked', willEnroll);
+    tile.style.borderColor = willEnroll ? sub.color : '';
+    const nameEl = tile.querySelector('.subj-check-name');
+    if(nameEl) nameEl.style.color = willEnroll ? sub.color : '';
+    // อัปเดต onclick ให้ toggle กลับ
+    tile.setAttribute('onclick', `toggleEnroll('${studentId}','${subjectId}',${!willEnroll})`);
+
+    // อัปเดต cache ถ้ามี
+    if(studentDetailCache && studentDetailCache.studentId === studentId){
+      if(willEnroll){
+        studentDetailCache.enrolledIds.add(subjectId);
+      } else {
+        studentDetailCache.enrolledIds.delete(subjectId);
+      }
+      studentDetailCache.enrolledSubjects = subjectsCache.filter(s => studentDetailCache.enrolledIds.has(s.id));
+    }
+    // อัปเดต count "วิชาที่เรียน (X/5)"
+    const sectionTitle = document.querySelector('.detail-section .section-title');
+    const allTitles = document.querySelectorAll('.detail-section .section-title');
+    allTitles.forEach(t => {
+      if(t.textContent.includes('วิชาที่เรียน')){
+        const count = studentDetailCache?.enrolledIds.size ?? 0;
+        t.textContent = `วิชาที่เรียน (${count}/${subjectsCache.length})`;
+      }
+    });
+  }
+
+  // ===== Save DB =====
+  let error;
+  if(willEnroll){
+    ({ error } = await sb.from('enrollments').insert({
+      student_id: studentId, subject_id: subjectId
+    }));
+    if(error && error.message.includes('duplicate')) error = null; // ignore duplicate
+  } else {
+    ({ error } = await sb.from('enrollments').delete()
+      .eq('student_id', studentId).eq('subject_id', subjectId));
+  }
+
+  if(error){
+    toast(error.message, 'error');
+    // rollback UI
+    if(tile){
+      const sub = subjectsCache.find(s => s.id === subjectId);
+      tile.classList.toggle('checked', !willEnroll);
+      tile.style.borderColor = !willEnroll ? sub.color : '';
+      const nameEl = tile.querySelector('.subj-check-name');
+      if(nameEl) nameEl.style.color = !willEnroll ? sub.color : '';
+      tile.setAttribute('onclick', `toggleEnroll('${studentId}','${subjectId}',${willEnroll})`);
+      // rollback cache
+      if(studentDetailCache && studentDetailCache.studentId === studentId){
+        if(!willEnroll){
+          studentDetailCache.enrolledIds.add(subjectId);
+        } else {
+          studentDetailCache.enrolledIds.delete(subjectId);
+        }
+        studentDetailCache.enrolledSubjects = subjectsCache.filter(s => studentDetailCache.enrolledIds.has(s.id));
+      }
+    }
+  }
+}
+
+async function editStudent(id){
+  const { data: s } = await sb.from('students').select('*').eq('id', id).single();
+  if(!s) return;
+  openStudentModal(s);
+}
+
+function openStudentModal(student){
+  const isEdit = !!student;
+  const gradeOpts = ['ม.1','ม.2','ม.3','ม.4','ม.5','ม.6'];
+  const currentGrade = student?.grade || '';
+  const isCustomGrade = currentGrade && !gradeOpts.includes(currentGrade);
+
+  showModal({
+    title: isEdit ? 'แก้ไขนักเรียน' : 'เพิ่มนักเรียน',
+    body: `
+      <div class="fg">
+        <label>ชื่อเล่น *</label>
+        <input id="m_st_nick" type="text" placeholder="เช่น ฟัน" value="${escapeHtml(student?.nickname || '')}">
+      </div>
+      <div class="fg">
+        <label>ชั้น</label>
+        <select id="m_st_grade_sel" onchange="onGradeSelectChange()">
+          <option value="">ไม่ระบุ</option>
+          ${gradeOpts.map(g => `<option value="${g}" ${currentGrade===g?'selected':''}>${g}</option>`).join('')}
+          <option value="__custom__" ${isCustomGrade?'selected':''}>พิมพ์เอง...</option>
+        </select>
+        <input id="m_st_grade_custom" type="text" placeholder="กรอกชั้น" 
+          class="${isCustomGrade ? '' : 'hidden'}" 
+          value="${isCustomGrade ? escapeHtml(currentGrade) : ''}" 
+          style="margin-top:8px;">
+      </div>
+      <div class="fg">
+        <label>Track (ไม่บังคับ)</label>
+        <select id="m_st_track">
+          <option value="">— ไม่ระบุ —</option>
+          ${tracksCache.map(t => `<option value="${t.id}" ${student?.track_id===t.id?'selected':''}>${escapeHtml(t.name)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="fg">
+        <label>หมายเหตุ (ไม่บังคับ)</label>
+        <textarea id="m_st_note" placeholder="เช่น เก่งคณิต ต้องทบทวนฟิสิกส์">${escapeHtml(student?.note || '')}</textarea>
+      </div>
+    `,
+    onSave: async () => {
+      const nickname = $('m_st_nick').value.trim();
+      if(!nickname){ toast('กรอกชื่อเล่น', 'error'); return false; }
+      const gradeSel = $('m_st_grade_sel').value;
+      let grade = '';
+      if(gradeSel === '__custom__'){
+        grade = $('m_st_grade_custom').value.trim();
+      } else {
+        grade = gradeSel;
+      }
+      const trackId = $('m_st_track').value || null;
+      const note = $('m_st_note').value.trim();
+      const payload = { nickname, grade: grade || null, track_id: trackId, note: note || null };
+      if(isEdit){
+        const { error } = await sb.from('students').update(payload).eq('id', student.id);
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('บันทึกเรียบร้อย', 'success');
+      } else {
+        const { error } = await sb.from('students').insert(payload);
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('เพิ่มนักเรียนเรียบร้อย', 'success');
+      }
+      clearStudentDetailCache();
+      renderCurrentView();
+      return true;
+    }
+  });
+}
+
+function onGradeSelectChange(){
+  const sel = $('m_st_grade_sel').value;
+  const custom = $('m_st_grade_custom');
+  if(sel === '__custom__'){
+    custom.classList.remove('hidden');
+    custom.focus();
+  } else {
+    custom.classList.add('hidden');
+  }
+}
+
+// ---------- LINK STUDENT ----------
+async function openLinkStudent(studentId, studentName){
+  // ดึง profile ที่ยังไม่ link (role = viewer, student, pending — ทุกแบบที่ไม่ใช่ admin)
+  const { data: profs } = await sb.from('profiles')
+    .select('id, email, display_name, role, approved')
+    .is('student_id', null)
+    .neq('role', 'admin')
+    .order('created_at', {ascending:false});
+
+  if(!profs || profs.length === 0){
+    toast('ไม่มีบัญชีที่ยังไม่ลิงก์', 'error');
+    return;
+  }
+
+  showModal({
+    title: `ลิงก์บัญชีกับ "${studentName}"`,
+    body: `
+      <div style="font-size:13px;color:var(--t2);margin-bottom:14px;">
+        เลือกบัญชีที่ต้องการลิงก์กับนักเรียนคนนี้ บัญชีจะถูกเปลี่ยน role เป็น "student" และอนุมัติทันที
+      </div>
+      <div class="fg">
+        <label>เลือกบัญชี</label>
+        <select id="m_link_profile">
+          <option value="">— เลือกบัญชี —</option>
+          ${profs.map(p => {
+            const tag = p.role === 'pending' ? ' [pending]' 
+                     : p.role === 'viewer' ? ' [viewer]'
+                     : p.role === 'student' ? ' [student]'
+                     : '';
+            return `<option value="${p.id}">
+              ${escapeHtml(p.display_name || p.email)} (${escapeHtml(p.email)})${tag}
+            </option>`;
+          }).join('')}
+        </select>
+      </div>
+    `,
+    saveText: 'ลิงก์',
+    onSave: async () => {
+      const profileId = $('m_link_profile').value;
+      if(!profileId){ toast('เลือกบัญชี', 'error'); return false; }
+      const { error } = await sb.from('profiles').update({
+        student_id: studentId,
+        role: 'student',
+        approved: true
+      }).eq('id', profileId);
+      if(error){ toast(error.message, 'error'); return false; }
+      toast('ลิงก์สำเร็จ', 'success');
+      await refreshPendingCount();
+      clearStudentDetailCache();
+      renderCurrentView();
+      return true;
+    }
+  });
+}
+
+async function unlinkStudent(profileId, studentName){
+  if(!confirm(`ยกเลิกการลิงก์บัญชีกับ "${studentName}"?\n(บัญชีจะกลับเป็น viewer)`)) return;
+  const { error } = await sb.from('profiles').update({
+    student_id: null,
+    role: 'viewer'
+  }).eq('id', profileId);
+  if(error){ toast(error.message, 'error'); return; }
+  toast('ยกเลิกการลิงก์เรียบร้อย', 'success');
+  clearStudentDetailCache();
+  renderCurrentView();
+}
+
+// ====================================================
+// ====== PENDING USERS (Bell icon) ====================
+// ====================================================
+
+function openPendingUsers(){
+  // เปิดเป็น "tab" ใหม่ (ไม่ใช่ใน bottom bar)
+  currentTab = 'pending-users';
+  navStack = [];
+  // un-highlight tab buttons
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  renderPendingUsersList();
+}
+
+async function renderPendingUsersList(){
+  hide('breadcrumb'); show('backBtn'); hide('topbarLogo'); show('topbarTitle');
+  $('topbarTitle').textContent = 'คำขออนุมัติ';
+  hide('fab');
+  // back button -> กลับไปที่ tab เดิม
+  $('backBtn').onclick = () => {
+    $('backBtn').onclick = goBack; // restore
+    if(currentProfile.role === 'admin'){
+      switchTab('curriculum');
+    } else {
+      switchTab('viewer-home');
+    }
+  };
+
+  const { data: pending, error } = await sb.from('profiles')
+    .select('*')
+    .or('approved.eq.false,and(role.eq.pending,approved.eq.false)')
+    .order('created_at', {ascending:false});
+
+  if(error){ toast(error.message, 'error'); return; }
+
+  // ดึงรายชื่อนักเรียนที่ยังไม่ link สำหรับ dropdown
+  const { data: unlinkedStudents } = await sb.from('students').select('id, nickname, grade')
+    .is('deleted_at', null);
+  const linkedSet = new Set();
+  const { data: linkedProfs } = await sb.from('profiles').select('student_id')
+    .not('student_id', 'is', null);
+  (linkedProfs || []).forEach(p => linkedSet.add(p.student_id));
+  const availStudents = (unlinkedStudents || []).filter(s => !linkedSet.has(s.id));
+
+  let html = '';
+  if(!pending || pending.length === 0){
+    html += `<div class="list-empty">
+      <div class="list-empty-icon">✨</div>
+      <div class="list-empty-text">ไม่มีคำขออนุมัติ</div>
+    </div>`;
+  } else {
+    html += '<div>';
+    for(const p of pending){
+      const initial = (p.display_name || p.email || '?').charAt(0).toUpperCase();
+      html += `
+        <div class="pending-card">
+          <div class="pending-info">
+            <div class="avatar">${escapeHtml(initial)}</div>
+            <div class="pending-info-body">
+              <div class="pending-info-name">${escapeHtml(p.display_name || '-')}</div>
+              <div class="pending-info-email">${escapeHtml(p.email)}</div>
+            </div>
+          </div>
+          <div class="pending-actions-row">
+            <button class="btn-mini btn-mini-pri" onclick="approveAs('${p.id}', 'viewer')">👁️ Viewer</button>
+            <button class="btn-mini btn-mini-pri" onclick="approveAsStudent('${p.id}', \`${escapeHtml(p.email).replace(/`/g,'\\`')}\`)">🎓 Student</button>
+            <button class="btn-mini btn-mini-danger" onclick="rejectPending('${p.id}', \`${escapeHtml(p.email).replace(/`/g,'\\`')}\`)">✗ ปฏิเสธ</button>
+          </div>
+        </div>`;
+    }
+    html += '</div>';
+
+    // เก็บไว้ใช้ใน approveAsStudent
+    window.__availStudents = availStudents;
+  }
+  $('content').innerHTML = html;
+}
+
+async function approveAs(profileId, role){
+  const { error } = await sb.from('profiles').update({
+    role, approved: true
+  }).eq('id', profileId);
+  if(error){ toast(error.message, 'error'); return; }
+  toast('อนุมัติเรียบร้อย', 'success');
+  await refreshPendingCount();
+  renderPendingUsersList();
+}
+
+function approveAsStudent(profileId, email){
+  const availStudents = window.__availStudents || [];
+
+  showModal({
+    title: 'อนุมัติเป็นนักเรียน',
+    body: `
+      <div style="font-size:13px;color:var(--t2);margin-bottom:14px;">
+        เลือกว่าจะลิงก์กับนักเรียนคนใด (ถ้ายังไม่มี ให้สร้างใหม่)<br>
+        <strong style="color:var(--t1)">${escapeHtml(email)}</strong>
+      </div>
+      <div class="fg">
+        <label>เลือกนักเรียน</label>
+        <select id="m_approve_student" onchange="onApproveStudentChange()">
+          <option value="">— สร้างนักเรียนใหม่ —</option>
+          ${availStudents.map(s => `<option value="${s.id}">${escapeHtml(s.nickname)}${s.grade ? ' · '+escapeHtml(s.grade) : ''}</option>`).join('')}
+        </select>
+      </div>
+      <div id="m_approve_new_wrap">
+        <div class="fg">
+          <label>ชื่อเล่น *</label>
+          <input id="m_approve_nick" type="text" placeholder="ชื่อเล่นนักเรียน">
+        </div>
+        <div class="fg">
+          <label>ชั้น (ไม่บังคับ)</label>
+          <input id="m_approve_grade" type="text" placeholder="เช่น ม.6">
+        </div>
+      </div>
+    `,
+    saveText: 'อนุมัติ',
+    onSave: async () => {
+      const sel = $('m_approve_student').value;
+      let studentId = sel;
+      if(!sel){
+        // สร้างใหม่
+        const nick = $('m_approve_nick').value.trim();
+        if(!nick){ toast('กรอกชื่อเล่น', 'error'); return false; }
+        const grade = $('m_approve_grade').value.trim();
+        const { data, error } = await sb.from('students').insert({
+          nickname: nick, grade: grade || null
+        }).select().single();
+        if(error){ toast(error.message, 'error'); return false; }
+        studentId = data.id;
+      }
+      const { error: err2 } = await sb.from('profiles').update({
+        role: 'student', approved: true, student_id: studentId
+      }).eq('id', profileId);
+      if(err2){ toast(err2.message, 'error'); return false; }
+      toast('อนุมัติเรียบร้อย', 'success');
+      await refreshPendingCount();
+      renderPendingUsersList();
+      return true;
+    }
+  });
+}
+
+function onApproveStudentChange(){
+  const sel = $('m_approve_student').value;
+  $('m_approve_new_wrap').classList.toggle('hidden', !!sel);
+}
+
+async function rejectPending(profileId, email){
+  if(!confirm(`ปฏิเสธคำขอจาก "${email}"?\n(บัญชีจะถูกลบออกจาก profiles)`)) return;
+  // ลบ profile (auth.users ยังอยู่ — admin ลบเองได้ใน Supabase)
+  const { error } = await sb.from('profiles').delete().eq('id', profileId);
+  if(error){ toast(error.message, 'error'); return; }
+  toast('ปฏิเสธเรียบร้อย', 'success');
+  await refreshPendingCount();
+  renderPendingUsersList();
+}
+
+
+// ====================================================
+// ====== TRACKING (Task 5.1) ==========================
+// ====================================================
+
+let trackingState = {
+  studentSearch: '',
+  collapsedChapters: new Set() // chapter ids ที่ถูกพับ
+};
+
+function renderTracking(){
+  const view = navStack[navStack.length-1];
+
+  if(!view){
+    hide('backBtn'); show('topbarLogo'); hide('topbarTitle');
+    hide('breadcrumb');
+    hide('fab');
+    renderTrackingStudentList();
+    return;
+  }
+
+  show('backBtn'); hide('topbarLogo'); show('topbarTitle');
+  hide('fab');
+
+  if(view.view === 'track-subjects'){
+    $('topbarTitle').textContent = view.studentName;
+    renderBreadcrumb([view.studentName]);
+    renderTrackingSubjectsPage(view);
+  } else if(view.view === 'track-items'){
+    $('topbarTitle').textContent = view.subjectName;
+    renderBreadcrumb([view.studentName, view.subjectName]);
+    renderTrackingItemsPage(view);
+  }
+}
+
+// หน้า 1: list นักเรียน
+async function renderTrackingStudentList(){
+  const { data: students, error } = await sb.from('students').select('*, tracks(name)')
+    .is('deleted_at', null).order('nickname');
+  if(error){ toast(error.message, 'error'); return; }
+
+  let enrolls = {};
+  if(students && students.length > 0){
+    const ids = students.map(s => s.id);
+    const { data: enrollData } = await sb.from('enrollments').select('student_id')
+      .in('student_id', ids);
+    (enrollData || []).forEach(e => {
+      enrolls[e.student_id] = (enrolls[e.student_id] || 0) + 1;
+    });
+  }
+
+  const filtered = (students || []).filter(s => {
+    if(!trackingState.studentSearch) return true;
+    const q = trackingState.studentSearch.toLowerCase();
+    return (s.nickname || '').toLowerCase().includes(q);
+  });
+
+  let html = `<div class="search-bar">
+    <input class="search-input" type="text" placeholder="ค้นหานักเรียน..." 
+      value="${escapeHtml(trackingState.studentSearch)}"
+      oninput="onTrackingSearch(this.value)">
+  </div>`;
+
+  if(filtered.length === 0){
+    html += `<div class="list-empty">
+      <div class="list-empty-icon">📭</div>
+      <div class="list-empty-text">${trackingState.studentSearch ? 'ไม่พบนักเรียน' : 'ยังไม่มีนักเรียน\nไปเพิ่มที่แท็บ "นักเรียน"'}</div>
+    </div>`;
+  } else {
+    html += '<div class="card-list">';
+    for(const s of filtered){
+      const initial = (s.nickname || '?').charAt(0).toUpperCase();
+      const trackName = s.tracks?.name || '';
+      html += `
+        <div class="item-card">
+          <div class="avatar">${escapeHtml(initial)}</div>
+          <div class="item-body" onclick="openTrackingStudent('${s.id}', \`${escapeHtml(s.nickname).replace(/`/g,'\\`')}\`)">
+            <div class="item-title">${escapeHtml(s.nickname)}</div>
+            <div class="item-meta">
+              ${s.grade ? `<span>${escapeHtml(s.grade)}</span>` : ''}
+              ${trackName ? `<span>· ${escapeHtml(trackName)}</span>` : ''}
+              <span>· ${enrolls[s.id] || 0} วิชา</span>
+            </div>
+          </div>
+          <div class="item-arrow">›</div>
+        </div>`;
+    }
+    html += '</div>';
+  }
+  $('content').innerHTML = html;
+}
+
+function onTrackingSearch(v){
+  trackingState.studentSearch = v;
+  renderTrackingStudentList();
+}
+
+function openTrackingStudent(id, name){
+  pushNav({ view:'track-subjects', studentId:id, studentName:name });
+}
+
+// หน้า 2: เลือกวิชา (5 tile + แสดง %)
+async function renderTrackingSubjectsPage(view){
+  const { data: enrolls } = await sb.from('enrollments').select('subject_id')
+    .eq('student_id', view.studentId);
+  const enrolledIds = new Set((enrolls || []).map(e => e.subject_id));
+
+  const progressBySubj = {};
+  for(const sub of subjectsCache){
+    progressBySubj[sub.id] = { total:0, done:0 };
+  }
+
+  // ดึง chapters ของวิชาที่ enroll
+  const enrolledSubjArr = Array.from(enrolledIds);
+  if(enrolledSubjArr.length > 0){
+    const { data: chaps } = await sb.from('chapters').select('id, subject_id')
+      .in('subject_id', enrolledSubjArr).is('deleted_at', null);
+    const allChapterIds = (chaps || []).map(c => c.id);
+    if(allChapterIds.length > 0){
+      const { data: topics } = await sb.from('topics').select('id, chapter_id')
+        .in('chapter_id', allChapterIds).is('deleted_at', null);
+      const chapterByTopic = {};
+      (topics || []).forEach(t => { chapterByTopic[t.id] = t.chapter_id; });
+      const topicIds = (topics || []).map(t => t.id);
+      if(topicIds.length > 0){
+        const { data: items } = await sb.from('items').select('id, topic_id, type')
+          .in('topic_id', topicIds).is('deleted_at', null);
+        const itemSubject = {};
+        const examItemIds = [];
+        (items || []).forEach(it => {
+          const chId = chapterByTopic[it.topic_id];
+          if(!chId) return;
+          const ch = (chaps || []).find(c => c.id === chId);
+          if(!ch) return;
+          itemSubject[it.id] = { subject_id: ch.subject_id, type: it.type };
+          progressBySubj[ch.subject_id].total++;
+          if(it.type === 'exam') examItemIds.push(it.id);
+        });
+        const itemIds = (items || []).map(it => it.id);
+        if(itemIds.length > 0){
+          const { data: progs } = await sb.from('progress').select('item_id, completed')
+            .eq('student_id', view.studentId).in('item_id', itemIds);
+          (progs || []).forEach(p => {
+            if(p.completed){
+              const inf = itemSubject[p.item_id];
+              if(inf && (inf.type === 'lesson' || inf.type === 'assignment')){
+                progressBySubj[inf.subject_id].done++;
+              }
+            }
+          });
+          if(examItemIds.length > 0){
+            const { data: scores } = await sb.from('exam_scores').select('item_id')
+              .eq('student_id', view.studentId).in('item_id', examItemIds);
+            const examDone = new Set();
+            (scores || []).forEach(s => examDone.add(s.item_id));
+            examDone.forEach(itemId => {
+              const inf = itemSubject[itemId];
+              if(inf) progressBySubj[inf.subject_id].done++;
+            });
+          }
+        }
+      }
+    }
+  }
+
+  let html = '<div class="subj-grid">';
+  for(const s of subjectsCache){
+    const isEnrolled = enrolledIds.has(s.id);
+    const stat = progressBySubj[s.id];
+    const pct = stat.total > 0 ? Math.round((stat.done / stat.total) * 100) : 0;
+    html += `
+      <div class="subj-tile ${!isEnrolled ? 'subj-tile-disabled' : ''}" 
+        style="border-left-color:${s.color}"
+        ${isEnrolled ? `onclick="openTrackingSubject('${view.studentId}', \`${escapeHtml(view.studentName).replace(/`/g,'\\`')}\`, '${s.id}', \`${escapeHtml(s.name).replace(/`/g,'\\`')}\`)"` : ''}>
+        <div class="subj-tile-icon">${s.icon}</div>
+        <div class="subj-tile-name">${escapeHtml(s.name)}</div>
+        <div class="subj-tile-count">
+          ${!isEnrolled ? 'ไม่ได้เรียน' : (stat.total > 0 ? `${stat.done}/${stat.total} (${pct}%)` : 'ยังไม่มีเนื้อหา')}
+        </div>
+      </div>`;
+  }
+  html += '</div>';
+  $('content').innerHTML = html;
+}
+
+function openTrackingSubject(studentId, studentName, subjectId, subjectName){
+  pushNav({ view:'track-items', studentId, studentName, subjectId, subjectName });
+}
+
+// หน้า 3: items accordion ตาม chapter
+async function renderTrackingItemsPage(view){
+  const { data: chaps, error: e1 } = await sb.from('chapters').select('*')
+    .eq('subject_id', view.subjectId)
+    .is('deleted_at', null).order('order_index');
+  if(e1){ toast(e1.message, 'error'); return; }
+
+  if(!chaps || chaps.length === 0){
+    $('content').innerHTML = `<div class="track-empty">ยังไม่มีบทในวิชานี้</div>`;
+    return;
+  }
+
+  const chapterIds = chaps.map(c => c.id);
+  const { data: topics } = await sb.from('topics').select('*')
+    .in('chapter_id', chapterIds).is('deleted_at', null).order('order_index');
+  const topicIds = (topics || []).map(t => t.id);
+  let items = [];
+  if(topicIds.length > 0){
+    const { data: itData } = await sb.from('items').select('*')
+      .in('topic_id', topicIds).is('deleted_at', null).order('order_index');
+    items = itData || [];
+  }
+  const itemIds = items.map(i => i.id);
+  let progress = {};
+  let examScoresLatest = {}; // item_id -> {score, max, attempts}
+  if(itemIds.length > 0){
+    const { data: progData } = await sb.from('progress').select('*')
+      .eq('student_id', view.studentId).in('item_id', itemIds);
+    (progData || []).forEach(p => { progress[p.item_id] = p; });
+
+    // ดึง exam scores
+    const examItemIds = items.filter(i => i.type === 'exam').map(i => i.id);
+    if(examItemIds.length > 0){
+      const { data: scoreData } = await sb.from('exam_scores').select('*')
+        .eq('student_id', view.studentId).in('item_id', examItemIds)
+        .order('attempt_no', { ascending: false });
+      // group by item_id, เก็บแค่ครั้งล่าสุด + count
+      (scoreData || []).forEach(s => {
+        if(!examScoresLatest[s.item_id]){
+          examScoresLatest[s.item_id] = { latest: s, count: 0 };
+        }
+        examScoresLatest[s.item_id].count++;
+      });
+    }
+  }
+
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  let html = '';
+
+  for(const ch of chaps){
+    const topicsInCh = (topics || []).filter(t => t.chapter_id === ch.id);
+    const itemsInCh = items.filter(i => topicsInCh.some(t => t.id === i.topic_id));
+    // นับ trackable = lesson + assignment + exam (exam มีคะแนน ≥1 ครั้ง = ทำแล้ว)
+    let doneCount = 0;
+    let total = 0;
+    for(const it of itemsInCh){
+      if(it.type === 'lesson' || it.type === 'assignment'){
+        total++;
+        if(progress[it.id]?.completed) doneCount++;
+      } else if(it.type === 'exam'){
+        total++;
+        if(examScoresLatest[it.id]) doneCount++;
+      }
+    }
+    const collapsed = trackingState.collapsedChapters.has(ch.id);
+
+    html += `
+      <div class="chap-block ${collapsed ? 'collapsed' : ''}" id="chap_${ch.id}">
+        <div class="chap-header" onclick="toggleChapter('${ch.id}')">
+          <div class="chap-toggle">⌄</div>
+          <div class="chap-name">${escapeHtml(ch.name)}</div>
+          <div class="chap-progress ${total > 0 && doneCount === total ? 'complete' : ''}">
+            ${total > 0 ? `${doneCount}/${total}` : '0/0'}
+          </div>
+        </div>
+        <div class="chap-body">`;
+
+    if(topicsInCh.length === 0){
+      html += `<div style="padding:16px;text-align:center;color:var(--t2);font-size:13px;">ยังไม่มีหัวข้อในบทนี้</div>`;
+    } else {
+      for(const tp of topicsInCh){
+        const itemsInTp = itemsInCh.filter(i => i.topic_id === tp.id);
+        html += `<div class="topic-block"><div class="topic-name">${escapeHtml(tp.name)}</div>`;
+        if(itemsInTp.length === 0){
+          html += `<div style="font-size:12px;color:var(--t3);padding:6px 0;">— ยังไม่มีรายการ —</div>`;
+        } else {
+          for(const it of itemsInTp){
+            html += renderTrackItem(it, progress[it.id], today, view.studentId, examScoresLatest[it.id]);
+          }
+        }
+        html += `</div>`;
+      }
+    }
+    html += `</div></div>`;
+  }
+  $('content').innerHTML = html;
+}
+
+function renderTrackItem(item, prog, today, studentId, examInfo){
+  const isLesson = item.type === 'lesson';
+  const isAssign = item.type === 'assignment';
+  const isExam = item.type === 'exam';
+  const completed = prog?.completed || false;
+
+  // ===== EXAM =====
+  if(isExam){
+    const hasScore = !!examInfo;
+    const isAdmin = currentProfile.role === 'admin';
+
+    let scoreHtml = '';
+    if(hasScore){
+      const sc = examInfo.latest;
+      const max = item.max_score;
+      const pct = max ? Math.round((sc.score / max) * 1000) / 10 : null;
+      const cls = pct == null ? '' : (pct >= 50 ? 'passed' : 'failed');
+      scoreHtml = `<div class="exam-score-display">
+        <span class="exam-score-value ${cls}">${sc.score}${max != null ? '/' + max : ''}${pct != null ? ` (${pct}%)` : ''}</span>
+        ${examInfo.count > 1 ? `<span class="exam-attempts-link" onclick="openExamHistory('${studentId}','${item.id}', \`${escapeHtml(item.title).replace(/`/g,'\\`')}\`,${item.max_score ?? 'null'})">📜 ${examInfo.count} ครั้ง</span>` : ''}
+      </div>`;
+    } else {
+      scoreHtml = `<div class="exam-score-display"><span style="color:var(--t3);">ยังไม่มีคะแนน</span></div>`;
+    }
+
+    let actionHtml = '';
+    if(isAdmin){
+      actionHtml = `<div class="exam-row-action">
+        <button class="btn-tiny btn-tiny-pri" onclick="openExamScore('${studentId}','${item.id}', \`${escapeHtml(item.title).replace(/`/g,'\\`')}\`,${item.max_score ?? 'null'}, null)">
+          ${hasScore ? '+ สอบใหม่' : '+ กรอกคะแนน'}
+        </button>
+        ${hasScore ? `<button class="btn-tiny" onclick="openExamHistory('${studentId}','${item.id}', \`${escapeHtml(item.title).replace(/`/g,'\\`')}\`,${item.max_score ?? 'null'})">📜 ประวัติ</button>` : ''}
+      </div>`;
+    }
+
+    const examFormBtn = item.url
+      ? `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ทำข้อสอบ">📝</button>`
+      : '';
+
+    return `
+      <div class="track-item exam" data-item-id="${item.id}">
+        <div class="track-checkbox ${hasScore ? 'checked' : ''} no-action">
+          ${hasScore ? '✓' : '–'}
+        </div>
+        <div class="track-item-body">
+          <div class="track-item-title">${escapeHtml(item.title)}</div>
+          <div class="track-item-meta">
+            <span>📊 สอบ${item.max_score != null ? ` · เต็ม ${item.max_score} คะแนน` : ''}</span>
+          </div>
+          ${scoreHtml}
+          ${actionHtml}
+        </div>
+        ${examFormBtn ? `<div class="track-item-actions" style="display:flex;gap:4px;margin-left:auto;">${examFormBtn}</div>` : ''}
+      </div>`;
+  }
+
+  // ===== LESSON / ASSIGNMENT =====
+  let isLate = false;
+  if(isAssign && completed && item.deadline && prog?.submitted_at){
+    isLate = new Date(prog.submitted_at) > new Date(item.deadline);
+  }
+
+  let metaHtml = '';
+  if(isLesson){
+    metaHtml = `<span>📖 เนื้อหา</span>`;
+  } else if(isAssign){
+    let dlHtml = 'ไม่มีกำหนดส่ง';
+    if(item.deadline){
+      const dl = new Date(item.deadline); dl.setHours(0,0,0,0);
+      const diff = Math.round((dl - today) / 86400000);
+      let cls = '';
+      let prefix = '';
+      if(completed && isLate){
+        cls = 'track-deadline-late';
+        prefix = '⚠️ ส่งช้า · ';
+      } else if(!completed && diff < 0){
+        cls = 'track-deadline-overdue';
+        prefix = '⚠️ เลย ';
+      } else if(!completed && diff <= 3){
+        cls = 'track-deadline-near';
+      }
+      const dlStr = fmtDate(item.deadline);
+      dlHtml = `<span class="${cls}">${prefix}กำหนดส่ง ${dlStr}</span>`;
+    }
+    metaHtml = `<span>📝 งาน</span><span>·</span>${dlHtml}`;
+  }
+
+  const isAdmin = currentProfile.role === 'admin';
+  const clickable = isAdmin;
+
+  let rowClass = '';
+  let cbClass = '';
+  if(completed){
+    if(isLate){
+      rowClass = 'completed-late';
+      cbClass = 'checked-late';
+    } else {
+      rowClass = 'completed';
+      cbClass = 'checked';
+    }
+  }
+
+  // Action buttons: ▶️ (lesson+url), 📝 (exam+url), 📎 (assignment)
+  let actionBtns = '';
+  if(isLesson && item.url){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ดูวิดิโอ">▶️</button>`;
+  }
+  if(isExam && item.url){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ทำข้อสอบ">📝</button>`;
+  }
+  if(isAssign){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openSubmissionsForItem('${item.id}', '${studentId}')" title="ไฟล์ส่ง">📎</button>`;
+  }
+  const actionsHtml = actionBtns ? `<div class="track-item-actions" style="display:flex;gap:4px;margin-left:auto;">${actionBtns}</div>` : '';
+
+  return `
+    <div class="track-item ${rowClass}" data-item-id="${item.id}" data-deadline="${item.deadline || ''}">
+      <div class="track-checkbox ${cbClass} ${!clickable ? 'no-action' : ''}"
+        ${clickable ? `onclick="toggleProgress('${studentId}', '${item.id}', ${!completed})"` : ''}>
+        ✓
+      </div>
+      <div class="track-item-body">
+        <div class="track-item-title">${escapeHtml(item.title)}</div>
+        <div class="track-item-meta">${metaHtml}</div>
+      </div>
+      ${actionsHtml}
+    </div>`;
+}
+
+async function toggleProgress(studentId, itemId, newValue){
+  // ===== Optimistic UI Update =====
+  const trackItem = document.querySelector(`.track-item[data-item-id="${itemId}"]`);
+  const cb = trackItem?.querySelector('.track-checkbox');
+  const deadlineStr = trackItem?.dataset.deadline;
+
+  // ตรวจว่าเป็น late submission ไหม (assignment + มี deadline + ติ๊กตอนนี้ + เลยกำหนดแล้ว)
+  let isLate = false;
+  if(newValue && deadlineStr){
+    isLate = new Date() > new Date(deadlineStr);
+  }
+
+  if(cb && trackItem){
+    // ล้าง class เก่า
+    cb.classList.remove('checked', 'checked-late');
+    trackItem.classList.remove('completed', 'completed-late');
+    // ใส่ class ใหม่ตาม state
+    if(newValue){
+      if(isLate){
+        cb.classList.add('checked-late');
+        trackItem.classList.add('completed-late');
+      } else {
+        cb.classList.add('checked');
+        trackItem.classList.add('completed');
+      }
+    }
+    // อัปเดต onclick
+    cb.setAttribute('onclick', `toggleProgress('${studentId}', '${itemId}', ${!newValue})`);
+    // อัปเดต badge ของ chapter
+    updateChapterBadge(itemId);
+    // อัปเดต deadline meta (สี + ข้อความ)
+    const dlSpan = trackItem.querySelector('.track-item-meta span:last-child');
+    if(dlSpan && deadlineStr){
+      dlSpan.classList.remove('track-deadline-overdue', 'track-deadline-near', 'track-deadline-late');
+      const txt = dlSpan.textContent.replace(/^⚠️\s*(เลย|ส่งช้า)\s*·?\s*/, '');
+      if(newValue && isLate){
+        dlSpan.classList.add('track-deadline-late');
+        dlSpan.textContent = '⚠️ ส่งช้า · ' + txt;
+      } else if(!newValue){
+        // ติ๊กออก: คำนวณใหม่
+        const today = new Date(); today.setHours(0,0,0,0);
+        const dl = new Date(deadlineStr); dl.setHours(0,0,0,0);
+        const diff = Math.round((dl - today) / 86400000);
+        if(diff < 0){
+          dlSpan.classList.add('track-deadline-overdue');
+          dlSpan.textContent = '⚠️ เลย ' + txt;
+        } else if(diff <= 3){
+          dlSpan.classList.add('track-deadline-near');
+          dlSpan.textContent = txt;
+        } else {
+          dlSpan.textContent = txt;
+        }
+      } else {
+        dlSpan.textContent = txt;
+      }
+    }
+  }
+
+  // ===== Save to DB =====
+  const payload = {
+    student_id: studentId,
+    item_id: itemId,
+    completed: newValue,
+    submitted_at: newValue ? new Date().toISOString() : null,
+    updated_by: currentUser.id,
+    updated_at: new Date().toISOString()
+  };
+
+  const { error } = await sb.from('progress').upsert(payload, {
+    onConflict: 'student_id,item_id'
+  });
+
+  if(error){
+    toast('บันทึกไม่สำเร็จ: ' + error.message, 'error');
+    // rollback UI
+    if(cb && trackItem){
+      cb.classList.remove('checked', 'checked-late');
+      trackItem.classList.remove('completed', 'completed-late');
+      cb.setAttribute('onclick', `toggleProgress('${studentId}', '${itemId}', ${newValue})`);
+      updateChapterBadge(itemId);
+    }
+  }
+}
+
+// อัปเดต progress badge ของ chapter จาก DOM (ไม่ต้อง query DB)
+function updateChapterBadge(itemId){
+  const trackItem = document.querySelector(`.track-item[data-item-id="${itemId}"]`);
+  if(!trackItem) return;
+  const chapBlock = trackItem.closest('.chap-block');
+  if(!chapBlock) return;
+  const allCbs = chapBlock.querySelectorAll('.track-checkbox:not(.no-action)');
+  const checkedCbs = chapBlock.querySelectorAll('.track-checkbox.checked:not(.no-action), .track-checkbox.checked-late:not(.no-action)');
+  const total = allCbs.length;
+  const done = checkedCbs.length;
+  const badge = chapBlock.querySelector('.chap-progress');
+  if(badge && total > 0){
+    badge.textContent = `${done}/${total}`;
+    badge.classList.toggle('complete', done === total);
+  }
+}
+
+function toggleChapter(chapterId){
+  if(trackingState.collapsedChapters.has(chapterId)){
+    trackingState.collapsedChapters.delete(chapterId);
+  } else {
+    trackingState.collapsedChapters.add(chapterId);
+  }
+  document.getElementById('chap_' + chapterId).classList.toggle('collapsed');
+}
+
+// ====================================================
+// ====== EXAM SCORE (Task 5.2) ========================
+// ====================================================
+
+function openExamScore(studentId, itemId, title, maxScore, existing){
+  // existing = null สำหรับ add ใหม่ หรือ row object สำหรับ edit
+  const isEdit = !!existing;
+  showModal({
+    title: isEdit ? `แก้ไขคะแนน — ${title}` : `กรอกคะแนน — ${title}`,
+    body: `
+      <div class="fg">
+        <label>คะแนน${maxScore != null ? ` (เต็ม ${maxScore})` : ''} *</label>
+        <input id="m_es_score" type="number" min="0" step="0.5" 
+          value="${existing?.score ?? ''}" 
+          placeholder="${maxScore != null ? 'เช่น ' + Math.floor(maxScore * 0.8) : 'คะแนนที่ได้'}"
+          oninput="updateExamPercent(${maxScore})">
+        <div id="m_es_percent" style="font-size:12px;color:var(--t2);margin-top:6px;"></div>
+      </div>
+      <div class="fg">
+        <label>วันที่สอบ</label>
+        ${renderDatePickerBtn('m_es_date', existing?.exam_date || fmtDateInput(new Date()), 'เลือกวันที่')}
+      </div>
+      <div class="fg">
+        <label>หมายเหตุ (ไม่บังคับ)</label>
+        <textarea id="m_es_note" placeholder="เช่น ทำผิดเรื่อง limit">${escapeHtml(existing?.note || '')}</textarea>
+      </div>
+    `,
+    saveText: 'บันทึกคะแนน',
+    onSave: async () => {
+      const score = parseFloat($('m_es_score').value);
+      if(isNaN(score) || score < 0){ toast('กรอกคะแนน', 'error'); return false; }
+      if(maxScore != null && score > maxScore){
+        if(!confirm(`คะแนน ${score} เกินเต็ม ${maxScore} — ยืนยันบันทึก?`)) return false;
+      }
+      const examDate = $('m_es_date').value || null;
+      const note = $('m_es_note').value.trim() || null;
+
+      if(isEdit){
+        const { error } = await sb.from('exam_scores').update({
+          score, exam_date: examDate, note,
+          updated_by: currentUser.id
+        }).eq('id', existing.id);
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('บันทึกคะแนนเรียบร้อย', 'success');
+      } else {
+        // หา attempt_no ถัดไป
+        const { data: lastRow } = await sb.from('exam_scores')
+          .select('attempt_no')
+          .eq('student_id', studentId).eq('item_id', itemId)
+          .order('attempt_no', { ascending:false }).limit(1);
+        const nextAttempt = (lastRow && lastRow[0]) ? lastRow[0].attempt_no + 1 : 1;
+        const { error } = await sb.from('exam_scores').insert({
+          student_id: studentId, item_id: itemId,
+          score, attempt_no: nextAttempt,
+          exam_date: examDate, note,
+          updated_by: currentUser.id
+        });
+        if(error){ toast(error.message, 'error'); return false; }
+        toast('บันทึกคะแนนครั้งที่ ' + nextAttempt, 'success');
+      }
+      renderCurrentView();
+      return true;
+    }
+  });
+  // คำนวณ % เริ่มต้น
+  setTimeout(() => updateExamPercent(maxScore), 50);
+}
+
+function updateExamPercent(maxScore){
+  const val = parseFloat($('m_es_score')?.value);
+  const out = $('m_es_percent');
+  if(!out) return;
+  if(isNaN(val) || maxScore == null){
+    out.textContent = '';
+    return;
+  }
+  const pct = Math.round((val / maxScore) * 1000) / 10;
+  const cls = pct >= 50 ? 'var(--ok)' : 'var(--err)';
+  out.innerHTML = `<span style="color:${cls};font-weight:600;">${pct}%</span> ${pct >= 80 ? '🎉' : pct >= 50 ? '👍' : '⚠️'}`;
+}
+
+async function openExamHistory(studentId, itemId, title, maxScore){
+  const { data: scores, error } = await sb.from('exam_scores').select('*')
+    .eq('student_id', studentId).eq('item_id', itemId)
+    .order('attempt_no', { ascending: false });
+  if(error){ toast(error.message, 'error'); return; }
+
+  const rowsHtml = (scores || []).map(s => {
+    const pct = maxScore != null ? Math.round((s.score / maxScore) * 1000) / 10 : null;
+    const cls = pct == null ? '' : (pct >= 50 ? 'passed' : 'failed');
+    return `<div class="history-row">
+      <div class="history-row-body">
+        <div class="history-attempt">ครั้งที่ ${s.attempt_no}</div>
+        <div class="history-score">
+          <span class="exam-score-value ${cls}">${s.score}${maxScore != null ? '/' + maxScore : ''}${pct != null ? ` (${pct}%)` : ''}</span>
+        </div>
+        <div class="history-date">${s.exam_date ? fmtDate(s.exam_date) : '-'}</div>
+        ${s.note ? `<div class="history-note">${escapeHtml(s.note)}</div>` : ''}
+      </div>
+      ${currentProfile.role === 'admin' ? `
+        <div class="item-actions">
+          <button class="icon-btn" onclick="closeAllModalsThen(() => editExamScore('${s.id}','${studentId}','${itemId}', \`${escapeHtml(title).replace(/`/g,'\\`')}\`, ${maxScore ?? 'null'}))">✏️</button>
+          <button class="icon-btn danger" onclick="deleteExamScore('${s.id}', \`${escapeHtml(title).replace(/`/g,'\\`')}\`, ${s.attempt_no})">🗑️</button>
+        </div>
+      ` : ''}
+    </div>`;
+  }).join('');
+
+  showModal({
+    title: `ประวัติคะแนน — ${title}`,
+    body: `
+      ${rowsHtml ? `<div class="history-list">${rowsHtml}</div>` : '<div style="text-align:center;color:var(--t2);padding:20px;">ไม่มีประวัติ</div>'}
+    `,
+    saveText: '+ เพิ่มคะแนนใหม่',
+    onSave: () => {
+      // ปิด modal ปัจจุบัน + เปิด modal เพิ่มคะแนน
+      setTimeout(() => openExamScore(studentId, itemId, title, maxScore, null), 200);
+      return true;
+    }
+  });
+}
+
+function closeAllModalsThen(fn){
+  document.querySelectorAll('.modal-bg').forEach(m => m.remove());
+  setTimeout(fn, 100);
+}
+
+async function editExamScore(scoreId, studentId, itemId, title, maxScore){
+  const { data: row } = await sb.from('exam_scores').select('*').eq('id', scoreId).single();
+  if(!row) return;
+  openExamScore(studentId, itemId, title, maxScore, row);
+}
+
+async function deleteExamScore(scoreId, title, attemptNo){
+  if(!confirm(`ลบคะแนนสอบครั้งที่ ${attemptNo} ของ "${title}"?`)) return;
+  const { error } = await sb.from('exam_scores').delete().eq('id', scoreId);
+  if(error){ toast(error.message, 'error'); return; }
+  toast('ลบเรียบร้อย', 'success');
+  closeAllModalsThen(() => renderCurrentView());
+}
+
+// ====================================================
+// ====== ATTENDANCE (Task 5.2) ========================
+// ====================================================
+
+let attendanceState = {
+  currentMonth: null,  // {year, month} (month 1-12)
+  subjectFilter: null  // subject_id หรือ null = ทุกวิชา
+};
+
+function getMinMonth(){
+  return { year: 2026, month: 5 };
+}
+
+function attendanceInit(){
+  if(!attendanceState.currentMonth){
+    const now = new Date();
+    attendanceState.currentMonth = { year: now.getFullYear(), month: now.getMonth() + 1 };
+    const min = getMinMonth();
+    // ถ้าเดือนปัจจุบันก่อน พ.ค. 2026 → ไปที่ min
+    if(attendanceState.currentMonth.year < min.year ||
+       (attendanceState.currentMonth.year === min.year && attendanceState.currentMonth.month < min.month)){
+      attendanceState.currentMonth = { ...min };
+    }
+  }
+}
+
+function changeAttendanceMonth(delta){
+  let { year, month } = attendanceState.currentMonth;
+  month += delta;
+  if(month < 1){ month = 12; year--; }
+  if(month > 12){ month = 1; year++; }
+  const min = getMinMonth();
+  if(year < min.year || (year === min.year && month < min.month)) return;
+  attendanceState.currentMonth = { year, month };
+  renderStudentDetail(navStack[navStack.length-1]);
+}
+
+function setAttendanceSubject(subjectId){
+  attendanceState.subjectFilter = subjectId;
+  renderStudentDetail(navStack[navStack.length-1]);
+}
+
+async function renderAttendanceCalendar(student, enrolledSubjects){
+  attendanceInit();
+  const { year, month } = attendanceState.currentMonth;
+  const min = getMinMonth();
+  const canPrev = !(year === min.year && month === min.month);
+
+  // ดึง attendance ของเดือนนี้
+  const startDate = `${year}-${String(month).padStart(2,'0')}-01`;
+  const lastDay = new Date(year, month, 0).getDate();
+  const endDate = `${year}-${String(month).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+
+  let q = sb.from('attendance').select('*')
+    .eq('student_id', student.id)
+    .gte('attend_date', startDate).lte('attend_date', endDate);
+  if(attendanceState.subjectFilter) q = q.eq('subject_id', attendanceState.subjectFilter);
+  const { data: records } = await q;
+
+  // group by date
+  const byDate = {};
+  (records || []).forEach(r => {
+    if(!byDate[r.attend_date]) byDate[r.attend_date] = [];
+    byDate[r.attend_date].push(r);
+  });
+
+  // header
+  const monthNames = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+  const beYear = year + 543;
+  let html = `<div class="cal-header">
+    <button class="cal-nav-btn" onclick="changeAttendanceMonth(-1)" ${!canPrev ? 'disabled' : ''}>‹</button>
+    <div class="cal-month">${monthNames[month-1]} ${beYear}</div>
+    <button class="cal-nav-btn" onclick="changeAttendanceMonth(1)">›</button>
+  </div>`;
+
+  // subject filter chips
+  html += `<div class="cal-subj-filter">
+    <button class="chip ${!attendanceState.subjectFilter ? 'active' : ''}" onclick="setAttendanceSubject(null)">ทุกวิชา</button>`;
+  for(const sub of enrolledSubjects){
+    html += `<button class="chip ${attendanceState.subjectFilter === sub.id ? 'active' : ''}" 
+      style="${attendanceState.subjectFilter === sub.id ? `background:${sub.color};border-color:${sub.color};` : ''}"
+      onclick="setAttendanceSubject('${sub.id}')">${sub.icon} ${escapeHtml(sub.name)}</button>`;
+  }
+  html += `</div>`;
+
+  // legend
+  html += `<div class="att-legend">
+    <div class="att-legend-item"><span class="cal-dot on_time"></span>ตรงเวลา</div>
+    <div class="att-legend-item"><span class="cal-dot late"></span>มาสาย</div>
+    <div class="att-legend-item"><span class="cal-dot online"></span>ออนไลน์</div>
+    <div class="att-legend-item"><span class="cal-dot absent"></span>ขาด</div>
+  </div>`;
+
+  // grid
+  const firstDay = new Date(year, month-1, 1).getDay(); // 0=Sun
+  const today = new Date(); today.setHours(0,0,0,0);
+  const todayKey = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+
+  html += `<div class="cal-grid">
+    <div class="cal-week-head">
+      <div>อา</div><div>จ</div><div>อ</div><div>พ</div><div>พฤ</div><div>ศ</div><div>ส</div>
+    </div>
+    <div class="cal-days">`;
+
+  // empty cells
+  for(let i = 0; i < firstDay; i++){
+    html += `<div class="cal-day empty"></div>`;
+  }
+  // days
+  for(let d = 1; d <= lastDay; d++){
+    const dateKey = `${year}-${String(month).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const isToday = dateKey === todayKey;
+    const recs = byDate[dateKey] || [];
+    const isFuture = new Date(dateKey) > today;
+
+    // dots — unique statuses
+    const statusSet = new Set(recs.map(r => r.status));
+    let dotsHtml = '';
+    ['on_time','late','online','absent'].forEach(st => {
+      if(statusSet.has(st)) dotsHtml += `<span class="cal-dot ${st}"></span>`;
+    });
+
+    html += `<div class="cal-day ${isToday ? 'today' : ''}" 
+      onclick="openAttendanceDay('${student.id}', \`${escapeHtml(student.nickname).replace(/`/g,'\\`')}\`, '${dateKey}')">
+      <div class="cal-day-num">${d}</div>
+      <div class="cal-dots">${dotsHtml}</div>
+    </div>`;
+  }
+  html += `</div></div>`;
+
+  return html;
+}
+
+async function openAttendanceDay(studentId, studentName, dateKey){
+  // ดึงวิชาที่ enroll
+  const { data: enrolls } = await sb.from('enrollments').select('subject_id')
+    .eq('student_id', studentId);
+  const enrolledIds = (enrolls || []).map(e => e.subject_id);
+  if(enrolledIds.length === 0){
+    toast('นักเรียนยังไม่ได้เลือกวิชา', 'error');
+    return;
+  }
+  const enrolledSubjects = subjectsCache.filter(s => enrolledIds.includes(s.id));
+
+  // ตรวจสอบว่าเป็นวันในอนาคตไหม
+  const today = new Date(); today.setHours(0,0,0,0);
+  const isFuture = new Date(dateKey) > today;
+
+  const dateObj = new Date(dateKey);
+  const dateStr = dateObj.toLocaleDateString('th-TH', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
+
+  // เก็บ context ไว้ใน window สำหรับ in-place update
+  window.__attCtx = { studentId, studentName, dateKey, enrolledSubjects };
+
+  showModal({
+    title: `เช็คชื่อ — ${studentName}`,
+    body: `
+      <div style="font-size:13px;color:var(--t2);margin-bottom:12px;">
+        ${dateStr}${isFuture ? ' <span style="color:var(--warn);">(วันในอนาคต)</span>' : ''}
+      </div>
+      <div id="att_modal_body"></div>
+    `,
+    saveText: 'ปิด',
+    onSave: () => true
+  });
+
+  // render สถานะแต่ละวิชา
+  await refreshAttendanceModalBody();
+}
+
+async function refreshAttendanceModalBody(){
+  const ctx = window.__attCtx;
+  if(!ctx) return;
+  const body = $('att_modal_body');
+  if(!body) return;
+
+  // ดึง attendance ของวันนี้
+  const { data: records } = await sb.from('attendance').select('*')
+    .eq('student_id', ctx.studentId).eq('attend_date', ctx.dateKey);
+  const byId = {};
+  (records || []).forEach(r => { byId[r.subject_id] = r; });
+
+  const isAdmin = currentProfile.role === 'admin';
+  let html = '';
+  for(const sub of ctx.enrolledSubjects){
+    const rec = byId[sub.id];
+    const status = rec?.status || null;
+    html += `<div class="att-row" style="border-left:4px solid ${sub.color};padding-left:10px;">
+      <div class="att-row-name">${sub.icon} ${escapeHtml(sub.name)}</div>
+    </div>
+    <div class="att-status-row" style="margin-bottom:14px;">
+      <button class="att-status-btn ${status === 'on_time' ? 'active on_time' : ''}" 
+        ${isAdmin ? `onclick="setAttendance('${ctx.studentId}','${sub.id}','${ctx.dateKey}','on_time')"` : 'disabled'}>
+        ตรงเวลา
+      </button>
+      <button class="att-status-btn ${status === 'late' ? 'active late' : ''}" 
+        ${isAdmin ? `onclick="setAttendance('${ctx.studentId}','${sub.id}','${ctx.dateKey}','late')"` : 'disabled'}>
+        มาสาย
+      </button>
+      <button class="att-status-btn ${status === 'online' ? 'active online' : ''}" 
+        ${isAdmin ? `onclick="setAttendance('${ctx.studentId}','${sub.id}','${ctx.dateKey}','online')"` : 'disabled'}>
+        ออนไลน์
+      </button>
+      <button class="att-status-btn ${status === 'absent' ? 'active absent' : ''}" 
+        ${isAdmin ? `onclick="setAttendance('${ctx.studentId}','${sub.id}','${ctx.dateKey}','absent')"` : 'disabled'}>
+        ขาด
+      </button>
+      <button class="att-status-btn" 
+        ${isAdmin && status ? `onclick="clearAttendance('${ctx.studentId}','${sub.id}','${ctx.dateKey}')"` : 'disabled'}>
+        ล้าง
+      </button>
+    </div>`;
+  }
+  body.innerHTML = html;
+}
+
+async function setAttendance(studentId, subjectId, dateKey, status){
+  // Optimistic update: ปุ่มเปลี่ยนสีทันที
+  const btnRow = document.querySelector(`button[onclick*="${subjectId}"][onclick*="${dateKey}"]`)?.closest('.att-status-row');
+  if(btnRow){
+    btnRow.querySelectorAll('.att-status-btn').forEach(b => {
+      b.classList.remove('active','on_time','late','online','absent');
+    });
+    const target = btnRow.querySelector(`button[onclick*="'${status}'"]`);
+    if(target) target.classList.add('active', status);
+    // เปิดปุ่มล้าง
+    const clearBtn = btnRow.querySelector('button:last-child');
+    if(clearBtn){
+      clearBtn.disabled = false;
+      clearBtn.setAttribute('onclick', `clearAttendance('${studentId}','${subjectId}','${dateKey}')`);
+    }
+  }
+
+  // Save DB
+  const { error } = await sb.from('attendance').upsert({
+    student_id: studentId,
+    subject_id: subjectId,
+    attend_date: dateKey,
+    status,
+    updated_by: currentUser.id,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'student_id,subject_id,attend_date' });
+
+  if(error){
+    toast(error.message, 'error');
+    await refreshAttendanceModalBody(); // rollback by refresh
+    return;
+  }
+
+  // อัปเดต dot บน calendar (ไม่ต้อง re-render ทั้งหน้า)
+  updateCalendarDot(dateKey);
+}
+
+async function clearAttendance(studentId, subjectId, dateKey){
+  // Optimistic: เคลียร์ปุ่มทันที
+  const btnRow = document.querySelector(`button[onclick*="${subjectId}"][onclick*="${dateKey}"]`)?.closest('.att-status-row');
+  if(btnRow){
+    btnRow.querySelectorAll('.att-status-btn').forEach(b => {
+      b.classList.remove('active','on_time','late','online','absent');
+    });
+    // ปิดปุ่มล้าง
+    const clearBtn = btnRow.querySelector('button:last-child');
+    if(clearBtn){
+      clearBtn.disabled = true;
+      clearBtn.removeAttribute('onclick');
+    }
+  }
+
+  const { error } = await sb.from('attendance').delete()
+    .eq('student_id', studentId).eq('subject_id', subjectId).eq('attend_date', dateKey);
+  if(error){
+    toast(error.message, 'error');
+    await refreshAttendanceModalBody();
+    return;
+  }
+  updateCalendarDot(dateKey);
+}
+
+// อัปเดต dot ของวันนี้บน calendar โดยไม่ re-render ทั้งหน้า
+async function updateCalendarDot(dateKey){
+  const ctx = window.__attCtx;
+  if(!ctx) return;
+  // หา cal-day cell ที่ตรงกับ dateKey
+  const cells = document.querySelectorAll('.cal-day');
+  // dateKey = "YYYY-MM-DD"
+  const d = parseInt(dateKey.split('-')[2], 10);
+  let targetCell = null;
+  cells.forEach(c => {
+    const num = c.querySelector('.cal-day-num');
+    if(num && parseInt(num.textContent, 10) === d && !c.classList.contains('empty')){
+      // ตรวจว่า cell นี้คือวันที่ดึง (ผ่าน onclick)
+      if(c.getAttribute('onclick')?.includes(dateKey)){
+        targetCell = c;
+      }
+    }
+  });
+  if(!targetCell) return;
+
+  // ดึง records ใหม่
+  let q = sb.from('attendance').select('status, subject_id')
+    .eq('student_id', ctx.studentId).eq('attend_date', dateKey);
+  if(attendanceState.subjectFilter) q = q.eq('subject_id', attendanceState.subjectFilter);
+  const { data: records } = await q;
+
+  // สร้าง dots
+  const statusSet = new Set((records || []).map(r => r.status));
+  let dotsHtml = '';
+  ['on_time','late','online','absent'].forEach(st => {
+    if(statusSet.has(st)) dotsHtml += `<span class="cal-dot ${st}"></span>`;
+  });
+  const dotsContainer = targetCell.querySelector('.cal-dots');
+  if(dotsContainer) dotsContainer.innerHTML = dotsHtml;
+}
+
+// ====================================================
+// ====== BULK ATTENDANCE (Task 5.3) ===================
+// ====================================================
+let bulkAttState = {
+  date: null,        // YYYY-MM-DD
+  subjectId: null    // เลือก subject ก่อน
+};
+
+function bulkAttInit(){
+  if(!bulkAttState.date){
+    bulkAttState.date = fmtDateInput(new Date());
+  }
+}
+
+async function renderBulkAttendance(){
+  bulkAttInit();
+  hide('backBtn'); show('topbarLogo'); hide('topbarTitle');
+  hide('breadcrumb');
+  hide('fab');
+
+  // ถ้ายังไม่เลือกวิชา → แสดงเฉพาะ filter bar + subject grid
+  if(!bulkAttState.subjectId){
+    renderBulkAttSubjectSelect();
+    return;
+  }
+  // มีวิชาแล้ว → แสดง list นักเรียน
+  await renderBulkAttStudentList();
+}
+
+function renderBulkAttSubjectSelect(){
+  let html = `<div class="bulk-filter-bar">
+    ${renderBulkDateRow()}
+    <div style="font-size:13px;font-weight:700;color:var(--t2);margin-bottom:8px;">เลือกวิชา</div>
+    <div class="subj-grid">`;
+  for(const sub of subjectsCache){
+    html += `
+      <div class="subj-tile" style="border-left-color:${sub.color}"
+        onclick="setBulkSubject('${sub.id}')">
+        <div class="subj-tile-icon">${sub.icon}</div>
+        <div class="subj-tile-name">${escapeHtml(sub.name)}</div>
+      </div>`;
+  }
+  html += `</div></div>`;
+  $('content').innerHTML = html;
+}
+
+function renderBulkDateRow(){
+  const min = getMinMonth();
+  const minDate = `${min.year}-${String(min.month).padStart(2,'0')}-01`;
+  const curDate = new Date(bulkAttState.date);
+  const prevDate = new Date(curDate);
+  prevDate.setDate(prevDate.getDate() - 1);
+  const canPrev = prevDate >= new Date(minDate);
+  // register callback
+  registerDatePickerCallback('bulk_date_input', (v) => {
+    if(v) setBulkDate(v);
+  });
+  return `<div class="bulk-date-row">
+    <button class="cal-nav-btn" onclick="changeBulkDate(-1)" ${!canPrev ? 'disabled' : ''}>‹</button>
+    <div style="flex:1;">${renderDatePickerBtn('bulk_date_input', bulkAttState.date, 'เลือกวันที่', minDate)}</div>
+    <button class="cal-nav-btn" onclick="changeBulkDate(1)">›</button>
+  </div>`;
+}
+
+function setBulkDate(d){
+  if(!d) return;
+  bulkAttState.date = d;
+  renderBulkAttendance();
+}
+
+function changeBulkDate(delta){
+  const dt = new Date(bulkAttState.date);
+  dt.setDate(dt.getDate() + delta);
+  const min = getMinMonth();
+  const minDate = new Date(`${min.year}-${String(min.month).padStart(2,'0')}-01`);
+  if(delta < 0 && dt < minDate) return;
+  bulkAttState.date = fmtDateInput(dt);
+  renderBulkAttendance();
+}
+
+function setBulkSubject(subjectId){
+  bulkAttState.subjectId = subjectId;
+  renderBulkAttendance();
+}
+
+function clearBulkSubject(){
+  bulkAttState.subjectId = null;
+  renderBulkAttendance();
+}
+
+async function renderBulkAttStudentList(){
+  const isAdmin = currentProfile.role === 'admin';
+  const sub = subjectsCache.find(s => s.id === bulkAttState.subjectId);
+  if(!sub){ clearBulkSubject(); return; }
+
+  // ดึงนักเรียนที่ enroll วิชานี้
+  const { data: enrolls, error: e1 } = await sb.from('enrollments')
+    .select('student_id, students(id, nickname, grade, tracks(name), deleted_at)')
+    .eq('subject_id', bulkAttState.subjectId);
+  if(e1){ toast(e1.message, 'error'); return; }
+
+  // กรอง active students
+  const students = (enrolls || [])
+    .map(e => e.students)
+    .filter(s => s && !s.deleted_at)
+    .sort((a,b) => (a.nickname || '').localeCompare(b.nickname || '', 'th'));
+
+  // ดึง attendance ของวันนี้+วิชานี้
+  const { data: records } = await sb.from('attendance').select('*')
+    .eq('subject_id', bulkAttState.subjectId)
+    .eq('attend_date', bulkAttState.date);
+  const byStudent = {};
+  (records || []).forEach(r => { byStudent[r.student_id] = r; });
+
+  // นับ stats
+  const stats = { on_time:0, late:0, online:0, absent:0, unset:0 };
+  students.forEach(s => {
+    const r = byStudent[s.id];
+    if(r) stats[r.status]++;
+    else stats.unset++;
+  });
+
+  const dateObj = new Date(bulkAttState.date);
+  const dateStr = dateObj.toLocaleDateString('th-TH', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
+
+  let html = `<div class="bulk-filter-bar">
+    ${renderBulkDateRow()}
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <span style="font-size:13px;color:var(--t2);">วิชา:</span>
+      <button class="chip active" style="background:${sub.color};border-color:${sub.color};">
+        ${sub.icon} ${escapeHtml(sub.name)}
+      </button>
+      <button class="chip" onclick="clearBulkSubject()" style="font-size:12px;">เปลี่ยน</button>
+    </div>
+    <div style="font-size:11px;color:var(--t3);margin-top:6px;">${dateStr}</div>
+  </div>`;
+
+  // Stats
+  html += `<div class="bulk-stats">
+    <div class="bulk-stat-card on_time"><div class="bulk-stat-num">${stats.on_time}</div><div class="bulk-stat-label">ตรงเวลา</div></div>
+    <div class="bulk-stat-card late"><div class="bulk-stat-num">${stats.late}</div><div class="bulk-stat-label">มาสาย</div></div>
+    <div class="bulk-stat-card online"><div class="bulk-stat-num">${stats.online}</div><div class="bulk-stat-label">ออนไลน์</div></div>
+    <div class="bulk-stat-card absent"><div class="bulk-stat-num">${stats.absent}</div><div class="bulk-stat-label">ขาด</div></div>
+    <div class="bulk-stat-card unset"><div class="bulk-stat-num">${stats.unset}</div><div class="bulk-stat-label">ยังไม่เช็ค</div></div>
+  </div>`;
+
+  // Bulk action button (admin only)
+  if(isAdmin && students.length > 0){
+    html += `<div style="display:flex;gap:8px;margin-bottom:12px;">
+      <button class="btn-outline" style="flex:1;font-size:12px;padding:8px;" onclick="openBulkAction()">
+        ⚡ ติ๊กหลายคนพร้อมกัน
+      </button>
+    </div>`;
+  }
+
+  if(students.length === 0){
+    html += `<div class="list-empty">
+      <div class="list-empty-icon">📭</div>
+      <div class="list-empty-text">ยังไม่มีนักเรียนเรียนวิชานี้</div>
+    </div>`;
+  } else {
+    html += '<div id="bulk_student_list">';
+    for(const stu of students){
+      const r = byStudent[stu.id];
+      const status = r?.status || null;
+      const initial = (stu.nickname || '?').charAt(0).toUpperCase();
+      html += `
+        <div class="bulk-row" data-student-id="${stu.id}">
+          <div class="bulk-row-head">
+            <div class="avatar sm">${escapeHtml(initial)}</div>
+            <div class="bulk-row-name">
+              ${escapeHtml(stu.nickname)}
+              ${stu.grade ? `<div class="bulk-row-grade">${escapeHtml(stu.grade)}</div>` : ''}
+            </div>
+          </div>
+          <div class="att-status-row">
+            <button class="att-status-btn ${status === 'on_time' ? 'active on_time' : ''}" 
+              ${isAdmin ? `onclick="setBulkAttendance('${stu.id}','on_time')"` : 'disabled'}>ตรงเวลา</button>
+            <button class="att-status-btn ${status === 'late' ? 'active late' : ''}" 
+              ${isAdmin ? `onclick="setBulkAttendance('${stu.id}','late')"` : 'disabled'}>มาสาย</button>
+            <button class="att-status-btn ${status === 'online' ? 'active online' : ''}" 
+              ${isAdmin ? `onclick="setBulkAttendance('${stu.id}','online')"` : 'disabled'}>ออนไลน์</button>
+            <button class="att-status-btn ${status === 'absent' ? 'active absent' : ''}" 
+              ${isAdmin ? `onclick="setBulkAttendance('${stu.id}','absent')"` : 'disabled'}>ขาด</button>
+            <button class="att-status-btn" 
+              ${isAdmin && status ? `onclick="clearBulkAttendance('${stu.id}')"` : 'disabled'}>ล้าง</button>
+          </div>
+        </div>`;
+    }
+    html += '</div>';
+  }
+  $('content').innerHTML = html;
+}
+
+// ===== Optimistic update for bulk attendance =====
+async function setBulkAttendance(studentId, status){
+  const row = document.querySelector(`.bulk-row[data-student-id="${studentId}"]`);
+  let oldStatus = null;
+  if(row){
+    const btnRow = row.querySelector('.att-status-row');
+    // หา status เดิมก่อน toggle
+    const activeBtn = btnRow.querySelector('.att-status-btn.active');
+    if(activeBtn){
+      ['on_time','late','online','absent'].forEach(st => {
+        if(activeBtn.classList.contains(st)) oldStatus = st;
+      });
+    }
+    // clear all
+    btnRow.querySelectorAll('.att-status-btn').forEach(b => {
+      b.classList.remove('active','on_time','late','online','absent');
+    });
+    // active new
+    const target = btnRow.querySelector(`button[onclick*="'${status}'"]`);
+    if(target) target.classList.add('active', status);
+    // enable clear
+    const clearBtn = btnRow.querySelector('button:last-child');
+    if(clearBtn){
+      clearBtn.disabled = false;
+      clearBtn.setAttribute('onclick', `clearBulkAttendance('${studentId}')`);
+    }
+  }
+  // update stats
+  updateBulkStats(oldStatus, status);
+
+  const { error } = await sb.from('attendance').upsert({
+    student_id: studentId,
+    subject_id: bulkAttState.subjectId,
+    attend_date: bulkAttState.date,
+    status,
+    updated_by: currentUser.id,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'student_id,subject_id,attend_date' });
+
+  if(error){
+    toast(error.message, 'error');
+    await renderBulkAttStudentList(); // re-render to rollback
+  }
+}
+
+async function clearBulkAttendance(studentId){
+  const row = document.querySelector(`.bulk-row[data-student-id="${studentId}"]`);
+  let oldStatus = null;
+  if(row){
+    const btnRow = row.querySelector('.att-status-row');
+    const activeBtn = btnRow.querySelector('.att-status-btn.active');
+    if(activeBtn){
+      ['on_time','late','online','absent'].forEach(st => {
+        if(activeBtn.classList.contains(st)) oldStatus = st;
+      });
+    }
+    btnRow.querySelectorAll('.att-status-btn').forEach(b => {
+      b.classList.remove('active','on_time','late','online','absent');
+    });
+    const clearBtn = btnRow.querySelector('button:last-child');
+    if(clearBtn){
+      clearBtn.disabled = true;
+      clearBtn.removeAttribute('onclick');
+    }
+  }
+  updateBulkStats(oldStatus, null);
+
+  const { error } = await sb.from('attendance').delete()
+    .eq('student_id', studentId)
+    .eq('subject_id', bulkAttState.subjectId)
+    .eq('attend_date', bulkAttState.date);
+  if(error){
+    toast(error.message, 'error');
+    await renderBulkAttStudentList();
+  }
+}
+
+function updateBulkStats(oldStatus, newStatus){
+  // ลดของเก่า
+  if(oldStatus){
+    const card = document.querySelector(`.bulk-stat-card.${oldStatus} .bulk-stat-num`);
+    if(card){
+      const v = parseInt(card.textContent, 10);
+      card.textContent = Math.max(0, v - 1);
+    }
+  } else {
+    // ก่อนหน้านี้ unset → ลดของ unset
+    const card = document.querySelector(`.bulk-stat-card.unset .bulk-stat-num`);
+    if(card){
+      const v = parseInt(card.textContent, 10);
+      card.textContent = Math.max(0, v - 1);
+    }
+  }
+  // เพิ่มของใหม่
+  if(newStatus){
+    const card = document.querySelector(`.bulk-stat-card.${newStatus} .bulk-stat-num`);
+    if(card){
+      const v = parseInt(card.textContent, 10);
+      card.textContent = v + 1;
+    }
+  } else {
+    // newStatus = null → เพิ่มใน unset
+    const card = document.querySelector(`.bulk-stat-card.unset .bulk-stat-num`);
+    if(card){
+      const v = parseInt(card.textContent, 10);
+      card.textContent = v + 1;
+    }
+  }
+}
+
+function openBulkAction(){
+  showModal({
+    title: 'ติ๊กหลายคนพร้อมกัน',
+    body: `
+      <div style="font-size:13px;color:var(--t2);margin-bottom:14px;">
+        เลือกการกระทำที่ต้องการ:
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <button class="att-status-btn active on_time" style="padding:14px;" onclick="bulkSetAll('on_time', false)">
+          ✓ ติ๊กทุกคน "ตรงเวลา"
+        </button>
+        <button class="att-status-btn active on_time" style="padding:14px;opacity:0.85;" onclick="bulkSetAll('on_time', true)">
+          ✓ ติ๊กเฉพาะที่ยังไม่เช็ค "ตรงเวลา"
+        </button>
+        <button class="att-status-btn active absent" style="padding:14px;" onclick="bulkSetAll('absent', false)">
+          ✗ ติ๊กทุกคน "ขาด"
+        </button>
+        <button class="att-status-btn active absent" style="padding:14px;opacity:0.85;" onclick="bulkSetAll('absent', true)">
+          ✗ ติ๊กเฉพาะที่ยังไม่เช็ค "ขาด"
+        </button>
+        <button class="btn-danger" style="padding:14px;" onclick="bulkClearAll()">
+          🗑️ ล้างทั้งหมด
+        </button>
+      </div>
+    `,
+    saveText: 'ปิด',
+    onSave: () => true
+  });
+}
+
+async function bulkSetAll(status, onlyUnset){
+  const confirmMsg = onlyUnset 
+    ? `ติ๊กเฉพาะคนที่ยังไม่เช็ค เป็น "${statusLabel(status)}"?`
+    : `ติ๊กทุกคน เป็น "${statusLabel(status)}"? (จะทับของเดิม)`;
+  if(!confirm(confirmMsg)) return;
+  closeAllModalsThen(async () => {
+    // ดึง list นักเรียน + status ปัจจุบัน
+    const rows = document.querySelectorAll('.bulk-row');
+    const promises = [];
+    rows.forEach(row => {
+      const studentId = row.dataset.studentId;
+      const activeBtn = row.querySelector('.att-status-btn.active');
+      if(onlyUnset && activeBtn) return; // skip ที่มีอยู่แล้ว
+      promises.push(
+        sb.from('attendance').upsert({
+          student_id: studentId,
+          subject_id: bulkAttState.subjectId,
+          attend_date: bulkAttState.date,
+          status,
+          updated_by: currentUser.id,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'student_id,subject_id,attend_date' })
+      );
+    });
+    if(promises.length === 0){
+      toast('ไม่มีอะไรให้ทำ', 'error');
+      return;
+    }
+    await Promise.all(promises);
+    toast(`บันทึก ${promises.length} คน`, 'success');
+    await renderBulkAttStudentList();
+  });
+}
+
+async function bulkClearAll(){
+  if(!confirm('ล้างการเช็คชื่อทั้งหมดของวันนี้+วิชานี้?\n(ลบทุก record ของวันนี้ คืนค่าเป็น "ยังไม่เช็ค")')) return;
+  closeAllModalsThen(async () => {
+    const { error } = await sb.from('attendance').delete()
+      .eq('subject_id', bulkAttState.subjectId)
+      .eq('attend_date', bulkAttState.date);
+    if(error){ toast(error.message, 'error'); return; }
+    toast('ล้างเรียบร้อย', 'success');
+    await renderBulkAttStudentList();
+  });
+}
+
+function statusLabel(s){
+  return { on_time:'ตรงเวลา', late:'มาสาย', online:'ออนไลน์', absent:'ขาด' }[s] || s;
+}
+
+// ====================================================
+// ====== STUDENT VIEW (Task 8) ========================
+// ====================================================
+
+// helper: ดึง student_id ของ user ปัจจุบัน (จาก profile)
+function getMyStudentId(){
+  return currentProfile?.student_id || null;
+}
+
+// helper: ดึงข้อมูล student ของฉันพร้อม enrolled subjects + track
+async function loadMyStudentData(){
+  const sid = getMyStudentId();
+  if(!sid) return null;
+  const { data: s } = await sb.from('students')
+    .select('*, tracks(id, name)').eq('id', sid).single();
+  if(!s) return null;
+  const { data: enrolls } = await sb.from('enrollments').select('subject_id')
+    .eq('student_id', sid);
+  const enrolledIds = new Set((enrolls || []).map(e => e.subject_id));
+  return {
+    student: s,
+    enrolledIds,
+    enrolledSubjects: subjectsCache.filter(sub => enrolledIds.has(sub.id))
+  };
+}
+
+// ---------- 🏠 Student Home ----------
+async function renderStudentHome(){
+  hide('backBtn'); show('topbarLogo'); hide('topbarTitle');
+  hide('breadcrumb'); hide('fab');
+
+  const myData = await loadMyStudentData();
+  if(!myData){
+    $('content').innerHTML = `<div class="list-empty">
+      <div class="list-empty-icon">⚠️</div>
+      <div class="list-empty-text">บัญชีของคุณยังไม่ได้ลิงก์กับนักเรียน\nกรุณาติดต่อผู้ดูแลระบบ</div>
+    </div>`;
+    return;
+  }
+
+  const { student: s, enrolledIds } = myData;
+
+  // คำนวณ progress ของฉัน
+  const stats = await calcMyProgress(s.id, s.track_id, enrolledIds);
+
+  // greeting
+  const hour = new Date().getHours();
+  let greetTime = 'สวัสดี';
+  let greetEmoji = '👋';
+  if(hour < 12){ greetTime = 'อรุณสวัสดิ์'; greetEmoji = '☀️'; }
+  else if(hour < 17){ greetTime = 'สวัสดีตอนบ่าย'; greetEmoji = '🌤️'; }
+  else if(hour < 20){ greetTime = 'สวัสดีตอนเย็น'; greetEmoji = '🌅'; }
+  else { greetTime = 'สวัสดีตอนค่ำ'; greetEmoji = '🌙'; }
+
+  const motivation = '"Hard work beats talent everytime"';
+
+  let html = `<div class="stu-greeting">
+    <div class="stu-greet-time">${greetTime} ${greetEmoji}</div>
+    <div class="stu-greet-name">${escapeHtml(s.nickname)}</div>
+    <div class="stu-greet-sub">${motivation}</div>
+  </div>`;
+
+  // KPI grid
+  html += `<div class="kpi-grid">
+    <div class="kpi-card ${stats.progressPct >= 75 ? 'ok' : stats.progressPct >= 50 ? '' : 'warn'}">
+      <div class="kpi-icon">📈</div>
+      <div class="kpi-num">${stats.progressPct}%</div>
+      <div class="kpi-label">ความคืบหน้ารวม</div>
+      <div class="kpi-sub">${stats.done}/${stats.total} รายการ</div>
+    </div>
+    <div class="kpi-card ${stats.overdue === 0 ? 'ok' : 'err'}">
+      <div class="kpi-icon">⏰</div>
+      <div class="kpi-num">${stats.overdue}</div>
+      <div class="kpi-label">งานเลย Deadline</div>
+      <div class="kpi-sub">${stats.overdue === 0 ? 'เยี่ยม!' : 'ต้องส่งด่วน'}</div>
+    </div>
+    <div class="kpi-card ${stats.avgScore == null ? '' : (stats.avgScore >= 50 ? 'ok' : 'warn')}">
+      <div class="kpi-icon">📊</div>
+      <div class="kpi-num">${stats.avgScore == null ? '-' : stats.avgScore + '%'}</div>
+      <div class="kpi-label">คะแนนสอบเฉลี่ย</div>
+      <div class="kpi-sub">รวมทุกข้อสอบ</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-icon">📅</div>
+      <div class="kpi-num">${stats.attendanceRate}%</div>
+      <div class="kpi-label">มาเรียน (30 วัน)</div>
+      <div class="kpi-sub">ตรงเวลา ${stats.onTime}</div>
+    </div>
+  </div>`;
+
+  // งานที่ใกล้/เลย deadline
+  if(stats.upcomingDeadlines.length > 0){
+    html += `<div class="stu-section-title">⏰ งานที่ต้องส่ง</div>`;
+    html += `<div class="stu-quick-card" style="padding:10px;">`;
+    stats.upcomingDeadlines.slice(0, 5).forEach(d => {
+      const sub = subjectsCache.find(x => x.id === d.subjectId);
+      let cls = '';
+      let prefix = '';
+      if(d.diffDays < 0){ cls = 'stu-deadline-overdue'; prefix = '⚠️ เลย '; }
+      else if(d.diffDays === 0){ cls = 'stu-deadline-near'; prefix = '⏰ วันนี้! '; }
+      else if(d.diffDays <= 3){ cls = 'stu-deadline-near'; prefix = `⏰ อีก ${d.diffDays} วัน · `; }
+      html += `<div class="stu-deadline-row">
+        <div class="stu-deadline-icon">${sub?.icon || '📝'}</div>
+        <div class="stu-deadline-body">
+          <div class="stu-deadline-title">${escapeHtml(d.title)}</div>
+          <div class="stu-deadline-meta">
+            <span class="${cls}">${prefix}${fmtDate(d.deadline)}</span> · ${escapeHtml(sub?.name || '')}
+          </div>
+        </div>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Progress per วิชา
+  if(stats.bySubject.length > 0){
+    html += `<div class="stu-section-title">📚 ความคืบหน้าแต่ละวิชา</div>`;
+    html += `<div class="bar-chart">`;
+    stats.bySubject.forEach(b => {
+      html += `<div class="bar-row">
+        <div class="bar-row-name">${b.subject.icon} <span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(b.subject.name)}</span></div>
+        <div class="bar-row-track">
+          <div class="bar-row-fill" style="background:${b.subject.color};width:${b.pct}%;">${b.pct}%</div>
+        </div>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  $('content').innerHTML = html;
+}
+
+// คำนวณสถิติของฉัน
+async function calcMyProgress(studentId, trackId, enrolledIds){
+  const result = {
+    progressPct: 0, done: 0, total: 0,
+    overdue: 0,
+    avgScore: null,
+    attendanceRate: 0, onTime: 0,
+    upcomingDeadlines: [],
+    bySubject: []
+  };
+
+  // ===== Curriculum items =====
+  const enrolledArr = Array.from(enrolledIds);
+  if(enrolledArr.length === 0){
+    return await fillAttendance(result, studentId);
+  }
+
+  const { data: chaps } = await sb.from('chapters').select('id, subject_id')
+    .in('subject_id', enrolledArr).is('deleted_at', null);
+  const chapterIds = (chaps || []).map(c => c.id);
+  if(chapterIds.length === 0) return await fillAttendance(result, studentId);
+
+  const { data: tps } = await sb.from('topics').select('id, chapter_id')
+    .in('chapter_id', chapterIds).is('deleted_at', null);
+  const topicIds = (tps || []).map(t => t.id);
+  if(topicIds.length === 0) return await fillAttendance(result, studentId);
+
+  const { data: items } = await sb.from('items').select('*')
+    .in('topic_id', topicIds).is('deleted_at', null);
+
+  // map: topic_id -> chapter_id -> subject_id
+  const topicChapter = {};
+  (tps || []).forEach(t => { topicChapter[t.id] = t.chapter_id; });
+  const chapterSubject = {};
+  (chaps || []).forEach(c => { chapterSubject[c.id] = c.subject_id; });
+
+  const myItems = items || [];
+
+  // ดึง progress + exam_scores
+  const itemIds = myItems.map(i => i.id);
+  let progressMap = {};
+  let examMap = {};
+  if(itemIds.length > 0){
+    const { data: progs } = await sb.from('progress').select('*')
+      .eq('student_id', studentId).in('item_id', itemIds);
+    (progs || []).forEach(p => { progressMap[p.item_id] = p; });
+
+    const examItemIds = myItems.filter(i => i.type === 'exam').map(i => i.id);
+    if(examItemIds.length > 0){
+      const { data: es } = await sb.from('exam_scores').select('*')
+        .eq('student_id', studentId).in('item_id', examItemIds)
+        .order('attempt_no', { ascending:false });
+      (es || []).forEach(e => {
+        if(!examMap[e.item_id]) examMap[e.item_id] = { latest: e, count: 0 };
+        examMap[e.item_id].count++;
+      });
+    }
+  }
+
+  // นับ progress รวม + per subject
+  const subjStats = {};
+  for(const sub of subjectsCache){
+    if(enrolledIds.has(sub.id)) subjStats[sub.id] = { done:0, total:0 };
+  }
+
+  const now = new Date();
+  let scoreSum = 0, scoreMax = 0;
+  for(const it of myItems){
+    const subId = chapterSubject[topicChapter[it.topic_id]];
+    if(!subId || !subjStats[subId]) continue;
+    subjStats[subId].total++;
+    result.total++;
+    if(it.type === 'lesson' || it.type === 'assignment'){
+      if(progressMap[it.id]?.completed){
+        subjStats[subId].done++;
+        result.done++;
+      }
+      // overdue + upcoming
+      if(it.type === 'assignment' && it.deadline && !progressMap[it.id]?.completed){
+        const dl = new Date(it.deadline);
+        const diffDays = Math.round((dl - now) / 86400000);
+        if(diffDays < 0) result.overdue++;
+        result.upcomingDeadlines.push({
+          title: it.title, deadline: it.deadline,
+          diffDays, subjectId: subId
+        });
+      }
+    } else if(it.type === 'exam'){
+      if(examMap[it.id]){
+        subjStats[subId].done++;
+        result.done++;
+        if(it.max_score){
+          scoreSum += examMap[it.id].latest.score;
+          scoreMax += it.max_score;
+        }
+      }
+    }
+  }
+
+  // sort upcoming by diff days (ascending: นานสุดก่อน → ใกล้สุด)
+  result.upcomingDeadlines.sort((a,b) => a.diffDays - b.diffDays);
+
+  result.progressPct = result.total > 0 ? Math.round((result.done / result.total) * 100) : 0;
+  result.avgScore = scoreMax > 0 ? Math.round((scoreSum / scoreMax) * 100) : null;
+
+  // bySubject
+  result.bySubject = Object.entries(subjStats)
+    .filter(([sid, st]) => st.total > 0)
+    .map(([sid, st]) => ({
+      subject: subjectsCache.find(s => s.id === sid),
+      pct: Math.round((st.done / st.total) * 100)
+    }))
+    .sort((a,b) => b.pct - a.pct);
+
+  return await fillAttendance(result, studentId);
+}
+
+async function fillAttendance(result, studentId){
+  // 30 วันล่าสุด
+  const today = new Date();
+  const start = new Date(today);
+  start.setDate(start.getDate() - 29);
+  const { data: att } = await sb.from('attendance').select('status')
+    .eq('student_id', studentId)
+    .gte('attend_date', fmtDateInput(start))
+    .lte('attend_date', fmtDateInput(today));
+
+  const total = (att || []).length;
+  if(total === 0){
+    result.attendanceRate = 100; // ยังไม่มีข้อมูล → 100%
+    result.onTime = 0;
+    return result;
+  }
+  const onTime = (att || []).filter(a => a.status === 'on_time').length;
+  const presentish = (att || []).filter(a => a.status !== 'absent').length;
+  result.attendanceRate = Math.round((presentish / total) * 100);
+  result.onTime = onTime;
+  return result;
+}
+
+// ---------- 📚 Student Learn ----------
+let stuLearnState = { subjectId: null, collapsedChapters: new Set() };
+
+async function renderStudentLearn(){
+  hide('breadcrumb');
+  const myData = await loadMyStudentData();
+  if(!myData){
+    $('content').innerHTML = `<div class="list-empty">
+      <div class="list-empty-icon">⚠️</div>
+      <div class="list-empty-text">บัญชียังไม่ลิงก์กับนักเรียน</div>
+    </div>`;
+    return;
+  }
+  const { student: s, enrolledIds, enrolledSubjects } = myData;
+
+  if(!stuLearnState.subjectId){
+    // หน้าเลือกวิชา
+    hide('backBtn'); show('topbarLogo'); hide('topbarTitle');
+    hide('fab');
+    await renderStudentLearnSubjects(s, enrolledIds);
+  } else {
+    // หน้า items
+    show('backBtn'); hide('topbarLogo'); show('topbarTitle');
+    const sub = subjectsCache.find(x => x.id === stuLearnState.subjectId);
+    $('topbarTitle').textContent = sub?.name || '';
+    hide('fab');
+    // override back button to go back to subject list
+    $('backBtn').onclick = () => {
+      stuLearnState.subjectId = null;
+      $('backBtn').onclick = goBack;
+      renderStudentLearn();
+    };
+    await renderStudentLearnItems(s);
+  }
+}
+
+async function renderStudentLearnSubjects(student, enrolledIds){
+  if(enrolledIds.size === 0){
+    $('content').innerHTML = `<div class="list-empty">
+      <div class="list-empty-icon">📚</div>
+      <div class="list-empty-text">ยังไม่ได้เลือกวิชา\nกรุณาติดต่อผู้ดูแลระบบ</div>
+    </div>`;
+    return;
+  }
+
+  const progressBySubj = {};
+  for(const sub of subjectsCache){
+    progressBySubj[sub.id] = { total:0, done:0 };
+  }
+
+  const enrolledArr = Array.from(enrolledIds);
+  const { data: chaps } = await sb.from('chapters').select('id, subject_id')
+    .in('subject_id', enrolledArr).is('deleted_at', null);
+  const chapterIds = (chaps || []).map(c => c.id);
+  if(chapterIds.length > 0){
+    const { data: tps } = await sb.from('topics').select('id, chapter_id')
+      .in('chapter_id', chapterIds).is('deleted_at', null);
+    const topicIds = (tps || []).map(t => t.id);
+    const chapterByTopic = {};
+    (tps || []).forEach(t => { chapterByTopic[t.id] = t.chapter_id; });
+    if(topicIds.length > 0){
+      const { data: items } = await sb.from('items').select('id, topic_id, type')
+        .in('topic_id', topicIds).is('deleted_at', null);
+      const itemSubject = {};
+      const examItemIds = [];
+      (items || []).forEach(it => {
+        const chId = chapterByTopic[it.topic_id];
+        const ch = (chaps || []).find(c => c.id === chId);
+        if(!ch) return;
+        itemSubject[it.id] = { subject_id: ch.subject_id, type: it.type };
+        progressBySubj[ch.subject_id].total++;
+        if(it.type === 'exam') examItemIds.push(it.id);
+      });
+      const itemIds = (items || []).map(it => it.id);
+      if(itemIds.length > 0){
+        const { data: progs } = await sb.from('progress').select('item_id, completed')
+          .eq('student_id', student.id).in('item_id', itemIds);
+        (progs || []).forEach(p => {
+          if(p.completed){
+            const inf = itemSubject[p.item_id];
+            if(inf && (inf.type === 'lesson' || inf.type === 'assignment')){
+              progressBySubj[inf.subject_id].done++;
+            }
+          }
+        });
+        if(examItemIds.length > 0){
+          const { data: scores } = await sb.from('exam_scores').select('item_id')
+            .eq('student_id', student.id).in('item_id', examItemIds);
+          const examDone = new Set();
+          (scores || []).forEach(s => examDone.add(s.item_id));
+          examDone.forEach(itemId => {
+            const inf = itemSubject[itemId];
+            if(inf) progressBySubj[inf.subject_id].done++;
+          });
+        }
+      }
+    }
+  }
+
+  let html = '<div class="subj-grid">';
+  for(const sub of subjectsCache){
+    if(!enrolledIds.has(sub.id)) continue;
+    const st = progressBySubj[sub.id];
+    const pct = st.total > 0 ? Math.round((st.done / st.total) * 100) : 0;
+    html += `
+      <div class="subj-tile" style="border-left-color:${sub.color}"
+        onclick="openStudentLearnSubject('${sub.id}')">
+        <div class="subj-tile-icon">${sub.icon}</div>
+        <div class="subj-tile-name">${escapeHtml(sub.name)}</div>
+        <div class="subj-tile-count">
+          ${st.total > 0 ? `${st.done}/${st.total} (${pct}%)` : 'ยังไม่มีเนื้อหา'}
+        </div>
+      </div>`;
+  }
+  html += '</div>';
+  $('content').innerHTML = html;
+}
+
+function openStudentLearnSubject(subjectId){
+  stuLearnState.subjectId = subjectId;
+  renderStudentLearn();
+}
+
+async function renderStudentLearnItems(student){
+  const { data: chaps } = await sb.from('chapters').select('*')
+    .eq('subject_id', stuLearnState.subjectId)
+    .is('deleted_at', null).order('order_index');
+  if(!chaps || chaps.length === 0){
+    $('content').innerHTML = `<div class="track-empty">ยังไม่มีบทในวิชานี้</div>`;
+    return;
+  }
+
+  const chapterIds = chaps.map(c => c.id);
+  const { data: topics } = await sb.from('topics').select('*')
+    .in('chapter_id', chapterIds).is('deleted_at', null).order('order_index');
+  const topicIds = (topics || []).map(t => t.id);
+  let items = [];
+  if(topicIds.length > 0){
+    const { data: itData } = await sb.from('items').select('*')
+      .in('topic_id', topicIds).is('deleted_at', null).order('order_index');
+    items = itData || [];
+  }
+  const itemIds = items.map(i => i.id);
+  let progress = {};
+  let examMap = {};
+  if(itemIds.length > 0){
+    const { data: progData } = await sb.from('progress').select('*')
+      .eq('student_id', student.id).in('item_id', itemIds);
+    (progData || []).forEach(p => { progress[p.item_id] = p; });
+
+    const examItemIds = items.filter(i => i.type === 'exam').map(i => i.id);
+    if(examItemIds.length > 0){
+      const { data: scoreData } = await sb.from('exam_scores').select('*')
+        .eq('student_id', student.id).in('item_id', examItemIds)
+        .order('attempt_no', { ascending: false });
+      (scoreData || []).forEach(s => {
+        if(!examMap[s.item_id]){
+          examMap[s.item_id] = { latest: s, count: 0 };
+        }
+        examMap[s.item_id].count++;
+      });
+    }
+  }
+
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  let html = '';
+
+  for(const ch of chaps){
+    const topicsInCh = (topics || []).filter(t => t.chapter_id === ch.id);
+    const itemsInCh = items.filter(i => topicsInCh.some(t => t.id === i.topic_id));
+    let doneCount = 0, total = 0;
+    for(const it of itemsInCh){
+      total++;
+      if(it.type === 'lesson' || it.type === 'assignment'){
+        if(progress[it.id]?.completed) doneCount++;
+      } else if(it.type === 'exam'){
+        if(examMap[it.id]) doneCount++;
+      }
+    }
+    const collapsed = stuLearnState.collapsedChapters.has(ch.id);
+
+    html += `
+      <div class="chap-block ${collapsed ? 'collapsed' : ''}" id="chap_${ch.id}">
+        <div class="chap-header" onclick="toggleStudentChapter('${ch.id}')">
+          <div class="chap-toggle">⌄</div>
+          <div class="chap-name">${escapeHtml(ch.name)}</div>
+          <div class="chap-progress ${total > 0 && doneCount === total ? 'complete' : ''}">
+            ${total > 0 ? `${doneCount}/${total}` : '0/0'}
+          </div>
+        </div>
+        <div class="chap-body">`;
+
+    if(topicsInCh.length === 0){
+      html += `<div style="padding:16px;text-align:center;color:var(--t2);font-size:13px;">ยังไม่มีหัวข้อ</div>`;
+    } else {
+      for(const tp of topicsInCh){
+        const itemsInTp = itemsInCh.filter(i => i.topic_id === tp.id);
+        html += `<div class="topic-block"><div class="topic-name">${escapeHtml(tp.name)}</div>`;
+        if(itemsInTp.length === 0){
+          html += `<div style="font-size:12px;color:var(--t3);padding:6px 0;">— ยังไม่มีรายการ —</div>`;
+        } else {
+          for(const it of itemsInTp){
+            html += renderStudentTrackItem(it, progress[it.id], today, examMap[it.id]);
+          }
+        }
+        html += `</div>`;
+      }
+    }
+    html += `</div></div>`;
+  }
+  $('content').innerHTML = html;
+}
+
+function toggleStudentChapter(chapterId){
+  if(stuLearnState.collapsedChapters.has(chapterId)){
+    stuLearnState.collapsedChapters.delete(chapterId);
+  } else {
+    stuLearnState.collapsedChapters.add(chapterId);
+  }
+  document.getElementById('chap_' + chapterId).classList.toggle('collapsed');
+}
+
+function renderStudentTrackItem(item, prog, today, examInfo){
+  const isLesson = item.type === 'lesson';
+  const isAssign = item.type === 'assignment';
+  const isExam = item.type === 'exam';
+  const completed = prog?.completed || false;
+
+  // ===== Action buttons (สำหรับทุก type) =====
+  let actionBtns = '';
+  if(isLesson && item.url){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ดูวิดิโอ">▶️</button>`;
+  }
+  if(isExam && item.url){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openLinkUrl(event, ${JSON.stringify(item.url).replace(/"/g,'&quot;')})" title="ทำข้อสอบ">📝</button>`;
+  }
+  if(isAssign && currentProfile.student_id){
+    actionBtns += `<button class="icon-btn link-btn" onclick="event.stopPropagation(); openSubmissionsForItem('${item.id}')" title="ไฟล์ส่ง">📎</button>`;
+  }
+  const actionsHtml = actionBtns ? `<div class="track-item-actions" style="display:flex;gap:4px;margin-left:auto;">${actionBtns}</div>` : '';
+
+  // exam
+  if(isExam){
+    const hasScore = !!examInfo;
+    let scoreHtml = '';
+    if(hasScore){
+      const sc = examInfo.latest;
+      const max = item.max_score;
+      const pct = max ? Math.round((sc.score / max) * 1000) / 10 : null;
+      const cls = pct == null ? '' : (pct >= 50 ? 'passed' : 'failed');
+      scoreHtml = `<div class="exam-score-display">
+        <span class="exam-score-value ${cls}">${sc.score}${max != null ? '/' + max : ''}${pct != null ? ` (${pct}%)` : ''}</span>
+        ${examInfo.count > 1 ? `<span class="exam-attempts-link">📜 ${examInfo.count} ครั้ง</span>` : ''}
+      </div>`;
+    } else {
+      scoreHtml = `<div class="exam-score-display"><span style="color:var(--t3);">ยังไม่มีคะแนน</span></div>`;
+    }
+    return `<div class="track-item exam">
+      <div class="track-checkbox ${hasScore ? 'checked' : ''} no-action">${hasScore ? '✓' : '–'}</div>
+      <div class="track-item-body">
+        <div class="track-item-title">${escapeHtml(item.title)}</div>
+        <div class="track-item-meta"><span>📊 สอบ${item.max_score != null ? ` · เต็ม ${item.max_score} คะแนน` : ''}</span></div>
+        ${scoreHtml}
+      </div>
+      ${actionsHtml}
+    </div>`;
+  }
+
+  let isLate = false;
+  if(isAssign && completed && item.deadline && prog?.submitted_at){
+    isLate = new Date(prog.submitted_at) > new Date(item.deadline);
+  }
+
+  let metaHtml = '';
+  if(isLesson){
+    metaHtml = `<span>📖 เนื้อหา</span>`;
+  } else if(isAssign){
+    let dlHtml = 'ไม่มีกำหนดส่ง';
+    if(item.deadline){
+      const dl = new Date(item.deadline); dl.setHours(0,0,0,0);
+      const diff = Math.round((dl - today) / 86400000);
+      let cls = ''; let prefix = '';
+      if(completed && isLate){ cls = 'track-deadline-late'; prefix = '⚠️ ส่งช้า · '; }
+      else if(!completed && diff < 0){ cls = 'track-deadline-overdue'; prefix = '⚠️ เลย '; }
+      else if(!completed && diff <= 3){ cls = 'track-deadline-near'; }
+      dlHtml = `<span class="${cls}">${prefix}กำหนดส่ง ${fmtDate(item.deadline)}</span>`;
+    }
+    metaHtml = `<span>📝 งาน</span><span>·</span>${dlHtml}`;
+  }
+
+  let rowClass = '', cbClass = '';
+  if(completed){
+    if(isLate){ rowClass = 'completed-late'; cbClass = 'checked-late'; }
+    else { rowClass = 'completed'; cbClass = 'checked'; }
+  }
+
+  return `<div class="track-item ${rowClass}">
+    <div class="track-checkbox ${cbClass} no-action">✓</div>
+    <div class="track-item-body">
+      <div class="track-item-title">${escapeHtml(item.title)}</div>
+      <div class="track-item-meta">${metaHtml}</div>
+    </div>
+    ${actionsHtml}
+  </div>`;
+}
+
+// ---------- 📅 Student Attendance ----------
+let stuAttState = { currentMonth: null, subjectFilter: null };
+
+async function renderStudentAttendance(){
+  hide('backBtn'); show('topbarLogo'); hide('topbarTitle');
+  hide('breadcrumb'); hide('fab');
+
+  const myData = await loadMyStudentData();
+  if(!myData){
+    $('content').innerHTML = `<div class="list-empty">
+      <div class="list-empty-icon">⚠️</div>
+      <div class="list-empty-text">บัญชียังไม่ลิงก์กับนักเรียน</div>
+    </div>`;
+    return;
+  }
+  if(myData.enrolledSubjects.length === 0){
+    $('content').innerHTML = `<div class="track-empty">ยังไม่ได้เลือกวิชา</div>`;
+    return;
+  }
+
+  // init month
+  if(!stuAttState.currentMonth){
+    const now = new Date();
+    stuAttState.currentMonth = { year: now.getFullYear(), month: now.getMonth() + 1 };
+    const min = getMinMonth();
+    if(stuAttState.currentMonth.year < min.year ||
+       (stuAttState.currentMonth.year === min.year && stuAttState.currentMonth.month < min.month)){
+      stuAttState.currentMonth = { ...min };
+    }
+  }
+
+  // เปลี่ยน attendanceState ชั่วคราว เพื่อใช้ renderAttendanceCalendar
+  const savedState = { ...attendanceState };
+  attendanceState.currentMonth = stuAttState.currentMonth;
+  attendanceState.subjectFilter = stuAttState.subjectFilter;
+  // override global change funcs ด้วย stu version
+  window.__originalChangeAtt = window.changeAttendanceMonth;
+  window.__originalSetAttSub = window.setAttendanceSubject;
+  window.changeAttendanceMonth = (d) => {
+    let { year, month } = stuAttState.currentMonth;
+    month += d;
+    if(month < 1){ month = 12; year--; }
+    if(month > 12){ month = 1; year++; }
+    const min = getMinMonth();
+    if(year < min.year || (year === min.year && month < min.month)) return;
+    stuAttState.currentMonth = { year, month };
+    renderStudentAttendance();
+  };
+  window.setAttendanceSubject = (subId) => {
+    stuAttState.subjectFilter = subId;
+    // Optimistic: highlight chip + re-render เฉพาะ calendar grid
+    refreshStudentCalendarOnly();
+  };
+
+  const html = await renderAttendanceCalendar(myData.student, myData.enrolledSubjects);
+  $('content').innerHTML = html;
+
+  // override day click — read only แสดง info เฉย ๆ
+  window.__originalOpenDay = window.openAttendanceDay;
+  window.openAttendanceDay = (sid, sname, dateKey) => {
+    openStudentAttendanceDay(sid, sname, dateKey);
+  };
+
+  // restore state
+  attendanceState.currentMonth = savedState.currentMonth;
+  attendanceState.subjectFilter = savedState.subjectFilter;
+}
+
+async function refreshStudentCalendarOnly(){
+  const myData = await loadMyStudentData();
+  if(!myData) return;
+  // ตั้งค่า attendanceState ชั่วคราว
+  const saved = { ...attendanceState };
+  attendanceState.currentMonth = stuAttState.currentMonth;
+  attendanceState.subjectFilter = stuAttState.subjectFilter;
+  const html = await renderAttendanceCalendar(myData.student, myData.enrolledSubjects);
+  $('content').innerHTML = html;
+  attendanceState.currentMonth = saved.currentMonth;
+  attendanceState.subjectFilter = saved.subjectFilter;
+}
+
+async function openStudentAttendanceDay(studentId, studentName, dateKey){
+  const { data: records } = await sb.from('attendance').select('*, subjects(name, color, icon)')
+    .eq('student_id', studentId).eq('attend_date', dateKey);
+
+  const dateObj = new Date(dateKey);
+  const dateStr = dateObj.toLocaleDateString('th-TH', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
+
+  let body = `<div style="font-size:13px;color:var(--t2);margin-bottom:12px;">${dateStr}</div>`;
+  if(!records || records.length === 0){
+    body += `<div style="text-align:center;color:var(--t3);padding:20px;font-size:13px;">ไม่มีการเช็คชื่อในวันนี้</div>`;
+  } else {
+    const labelMap = { on_time:'ตรงเวลา', late:'มาสาย', online:'ออนไลน์', absent:'ขาด' };
+    records.forEach(r => {
+      body += `<div class="att-row" style="border-left:4px solid ${r.subjects?.color || '#ccc'};padding-left:10px;margin-bottom:6px;">
+        <div class="att-row-name">${r.subjects?.icon || ''} ${escapeHtml(r.subjects?.name || '')}</div>
+        <span class="exam-score-value ${r.status === 'absent' ? 'failed' : (r.status === 'on_time' ? 'passed' : '')}" 
+          style="background:${r.status === 'on_time' ? '#D1FAE5' : r.status === 'late' ? '#FEF3C7' : r.status === 'online' ? '#EEF2FF' : '#FEE2E2'};
+                 color:${r.status === 'on_time' ? '#065F46' : r.status === 'late' ? '#92400E' : r.status === 'online' ? '#4F46E5' : '#991B1B'};">
+          ${labelMap[r.status]}
+        </span>
+      </div>`;
+    });
+  }
+
+  showModal({
+    title: studentName,
+    body,
+    saveText: 'ปิด',
+    onSave: () => true
+  });
+}
+
+// ---------- 📊 Student Scores ----------
+async function renderStudentScores(){
+  hide('backBtn'); show('topbarLogo'); hide('topbarTitle');
+  hide('breadcrumb'); hide('fab');
+
+  const myData = await loadMyStudentData();
+  if(!myData){
+    $('content').innerHTML = `<div class="list-empty">
+      <div class="list-empty-icon">⚠️</div>
+      <div class="list-empty-text">บัญชียังไม่ลิงก์กับนักเรียน</div>
+    </div>`;
+    return;
+  }
+  const { student: s } = myData;
+
+  // ดึงทุก exam_scores ของฉัน + join items + topics + chapters + subjects
+  const { data: scores } = await sb.from('exam_scores').select(`
+    *,
+    items (id, title, max_score, topic_id,
+      topics (id, name, chapter_id,
+        chapters (id, name, subject_id,
+          subjects (id, name, color, icon)
+        )
+      )
+    )
+  `).eq('student_id', s.id).order('exam_date', { ascending: false }).order('attempt_no', { ascending: false });
+
+  if(!scores || scores.length === 0){
+    $('content').innerHTML = `<div class="list-empty">
+      <div class="list-empty-icon">📊</div>
+      <div class="list-empty-text">ยังไม่มีคะแนนสอบ</div>
+    </div>`;
+    return;
+  }
+
+  // group by item_id (เก็บแค่ latest)
+  const byItem = {};
+  scores.forEach(s => {
+    if(!byItem[s.item_id]){
+      byItem[s.item_id] = { latest: s, count: 0, allScores: [] };
+    }
+    byItem[s.item_id].count++;
+    byItem[s.item_id].allScores.push(s);
+  });
+
+  // คำนวณคะแนนเฉลี่ย
+  let totalSum = 0, totalMax = 0;
+  Object.values(byItem).forEach(grp => {
+    if(grp.latest.items?.max_score){
+      totalSum += grp.latest.score;
+      totalMax += grp.latest.items.max_score;
+    }
+  });
+  const avgPct = totalMax > 0 ? Math.round((totalSum / totalMax) * 100) : null;
+
+  let html = '';
+  if(avgPct != null){
+    html += `<div class="stu-greeting" style="margin-bottom:14px;background:${avgPct >= 50 ? 'linear-gradient(135deg, #10B981, #059669)' : 'linear-gradient(135deg, #F59E0B, #EA580C)'};">
+      <div class="stu-greet-time">คะแนนเฉลี่ยรวม</div>
+      <div class="stu-greet-name">${avgPct}%</div>
+      <div class="stu-greet-sub">จากข้อสอบ ${Object.keys(byItem).length} รายการ</div>
+    </div>`;
+  }
+
+  // group by subject
+  const bySubject = {};
+  Object.values(byItem).forEach(grp => {
+    const sub = grp.latest.items?.topics?.chapters?.subjects;
+    if(!sub) return;
+    if(!bySubject[sub.id]) bySubject[sub.id] = { subject: sub, items: [] };
+    bySubject[sub.id].items.push(grp);
+  });
+
+  // sort subjects by subjectsCache order
+  const sortedSubjects = subjectsCache.filter(s => bySubject[s.id]);
+
+  for(const sub of sortedSubjects){
+    const grp = bySubject[sub.id];
+    html += `<div class="stu-section-title" style="display:flex;align-items:center;gap:6px;">
+      <span style="color:${sub.color};">${sub.icon}</span> ${escapeHtml(sub.name)}
+    </div>`;
+    for(const item of grp.items){
+      const it = item.latest.items;
+      const sc = item.latest;
+      const max = it.max_score;
+      const pct = max ? Math.round((sc.score / max) * 1000) / 10 : null;
+      const cls = pct == null ? 'no-max' : (pct >= 50 ? 'passed' : 'failed');
+      const pctCls = pct == null ? '' : (pct >= 50 ? 'passed' : 'failed');
+      const chapterName = it.topics?.chapters?.name;
+      const topicName = it.topics?.name;
+
+      html += `<div class="stu-exam-card ${cls}">
+        <div class="stu-exam-head">
+          <div class="stu-exam-subj-icon">${sub.icon}</div>
+          <div class="stu-exam-info">
+            <div class="stu-exam-title">${escapeHtml(it.title)}</div>
+            <div class="stu-exam-path">${escapeHtml(chapterName || '')} › ${escapeHtml(topicName || '')}</div>
+          </div>
+          <div class="stu-exam-score">
+            <div>${sc.score}${max != null ? `/${max}` : ''}</div>
+            ${pct != null ? `<div class="stu-exam-pct" style="color:${pct >= 50 ? 'var(--ok)' : 'var(--err)'};">${pct}%</div>` : ''}
+          </div>
+        </div>
+        <div class="stu-exam-meta">
+          ${sc.exam_date ? `<span>📅 ${fmtDate(sc.exam_date)}</span>` : ''}
+          ${item.count > 1 ? `<span class="stu-attempt-link" onclick="openMyExamHistory('${it.id}', \`${escapeHtml(it.title).replace(/`/g,'\\`')}\`, ${max ?? 'null'})">📜 ${item.count} ครั้ง</span>` : ''}
+        </div>
+        ${sc.note ? `<div style="font-size:12px;color:var(--t2);margin-top:6px;font-style:italic;">📝 ${escapeHtml(sc.note)}</div>` : ''}
+      </div>`;
+    }
+  }
+
+  $('content').innerHTML = html;
+}
+
+async function openMyExamHistory(itemId, title, maxScore){
+  const sid = getMyStudentId();
+  if(!sid) return;
+  const { data: scores } = await sb.from('exam_scores').select('*')
+    .eq('student_id', sid).eq('item_id', itemId)
+    .order('attempt_no', { ascending: false });
+
+  const rowsHtml = (scores || []).map(s => {
+    const pct = maxScore != null ? Math.round((s.score / maxScore) * 1000) / 10 : null;
+    const cls = pct == null ? '' : (pct >= 50 ? 'passed' : 'failed');
+    return `<div class="history-row">
+      <div class="history-row-body">
+        <div class="history-attempt">ครั้งที่ ${s.attempt_no}</div>
+        <div class="history-score">
+          <span class="exam-score-value ${cls}">${s.score}${maxScore != null ? '/' + maxScore : ''}${pct != null ? ` (${pct}%)` : ''}</span>
+        </div>
+        <div class="history-date">${s.exam_date ? fmtDate(s.exam_date) : '-'}</div>
+        ${s.note ? `<div class="history-note">${escapeHtml(s.note)}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  showModal({
+    title: `ประวัติ — ${title}`,
+    body: rowsHtml ? `<div class="history-list">${rowsHtml}</div>` : '<div style="text-align:center;color:var(--t2);padding:20px;">ไม่มีประวัติ</div>',
+    saveText: 'ปิด',
+    onSave: () => true
+  });
+}
+
+
+// ====================================================
+// ====== DASHBOARD (Task 6) ===========================
+// ====================================================
+let dashState = {
+  trackFilter: '__all__',     // track id หรือ '__all__'
+  rangeFilter: 'week',        // 'week' | 'month'
+  cache: null                 // cached data
+};
+
+async function renderDashboard(){
+  hide('backBtn'); show('topbarLogo'); hide('topbarTitle');
+  hide('breadcrumb'); hide('fab');
+
+  // ตรวจมี tracks ไหม
+  if(tracksCache.length === 0){
+    $('content').innerHTML = `<div class="list-empty">
+      <div class="list-empty-icon">📊</div>
+      <div class="list-empty-text">ยังไม่มี Track\nไปเพิ่มที่แท็บ "หลักสูตร" ก่อน</div>
+    </div>`;
+    return;
+  }
+
+  // render shell + filter bar
+  renderDashShell();
+
+  // ดึงข้อมูลทั้งหมด
+  $('dash_body').innerHTML = `<div class="dash-loading">⏳ กำลังโหลดข้อมูล...</div>`;
+  const data = await loadDashboardData();
+  if(!data){ return; }
+
+  // render แต่ละ section
+  renderDashContent(data);
+}
+
+function renderDashShell(){
+  const html = `
+    <div class="dash-filter-bar">
+      <select id="dash_track" onchange="setDashTrack(this.value)">
+        <option value="__all__" ${dashState.trackFilter === '__all__' ? 'selected' : ''}>ทุก Track</option>
+        ${tracksCache.map(t => `<option value="${t.id}" ${dashState.trackFilter === t.id ? 'selected' : ''}>${escapeHtml(t.name)}</option>`).join('')}
+      </select>
+      <select id="dash_range" onchange="setDashRange(this.value)">
+        <option value="week" ${dashState.rangeFilter === 'week' ? 'selected' : ''}>7 วันล่าสุด</option>
+        <option value="month" ${dashState.rangeFilter === 'month' ? 'selected' : ''}>30 วันล่าสุด</option>
+      </select>
+      <button class="btn-outline" style="padding:8px 12px;font-size:12px;" onclick="refreshDashboard()">🔄</button>
+    </div>
+    <div id="dash_body"></div>
+  `;
+  $('content').innerHTML = html;
+}
+
+function setDashTrack(v){ dashState.trackFilter = v; renderDashboard(); }
+function setDashRange(v){ dashState.rangeFilter = v; renderDashboard(); }
+function refreshDashboard(){ dashState.cache = null; renderDashboard(); }
+
+async function loadDashboardData(){
+  // ===== 1. Students =====
+  let stuQ = sb.from('students').select('id, nickname, grade, track_id, tracks(name)')
+    .is('deleted_at', null);
+  if(dashState.trackFilter !== '__all__'){
+    stuQ = stuQ.eq('track_id', dashState.trackFilter);
+  }
+  const { data: students } = await stuQ;
+  if(!students || students.length === 0){
+    $('dash_body').innerHTML = `<div class="list-empty">
+      <div class="list-empty-icon">📭</div>
+      <div class="list-empty-text">ไม่มีนักเรียนใน Track นี้</div>
+    </div>`;
+    return null;
+  }
+  const studentIds = students.map(s => s.id);
+  const studentMap = {};
+  students.forEach(s => { studentMap[s.id] = s; });
+
+  // ===== 2. Enrollments =====
+  const { data: enrollments } = await sb.from('enrollments')
+    .select('student_id, subject_id').in('student_id', studentIds);
+  const enrollMap = {}; // studentId -> Set(subjectId)
+  (enrollments || []).forEach(e => {
+    if(!enrollMap[e.student_id]) enrollMap[e.student_id] = new Set();
+    enrollMap[e.student_id].add(e.subject_id);
+  });
+
+  // ===== 3. Curriculum (items) =====
+  // ถ้า filter track → ดึงเฉพาะวิชาที่นักเรียน track นั้นเรียน
+  let subjectIdsToInclude = subjectsCache.map(s => s.id);
+  if(dashState.trackFilter !== '__all__'){
+    const trackStudentIds = students.map(s => s.id);
+    // ดึง subjects ที่นักเรียนใน track นี้ enroll
+    const subjs = new Set();
+    (enrollments || []).forEach(e => subjs.add(e.subject_id));
+    subjectIdsToInclude = Array.from(subjs);
+  }
+
+  let chQ = sb.from('chapters').select('id, subject_id').is('deleted_at', null);
+  if(subjectIdsToInclude.length > 0){
+    chQ = chQ.in('subject_id', subjectIdsToInclude);
+  }
+  const { data: chapters } = await chQ;
+  const chapterIds = (chapters || []).map(c => c.id);
+  const chapterMap = {};
+  (chapters || []).forEach(c => { chapterMap[c.id] = c; });
+
+  let topics = [];
+  if(chapterIds.length > 0){
+    const { data: tps } = await sb.from('topics').select('id, chapter_id')
+      .in('chapter_id', chapterIds).is('deleted_at', null);
+    topics = tps || [];
+  }
+  const topicMap = {};
+  topics.forEach(t => { topicMap[t.id] = t; });
+  const topicIds = topics.map(t => t.id);
+
+  let items = [];
+  if(topicIds.length > 0){
+    const { data: its } = await sb.from('items').select('id, topic_id, type, max_score, deadline')
+      .in('topic_id', topicIds).is('deleted_at', null);
+    items = its || [];
+  }
+  // item -> subject_id mapping
+  const itemSubject = {};
+  items.forEach(it => {
+    const tp = topicMap[it.topic_id];
+    if(!tp) return;
+    const ch = chapterMap[tp.chapter_id];
+    if(!ch) return;
+    itemSubject[it.id] = ch.subject_id;
+  });
+
+  // ===== 4. Progress =====
+  const itemIds = items.map(i => i.id);
+  let progress = [];
+  if(itemIds.length > 0 && studentIds.length > 0){
+    const { data: pData } = await sb.from('progress').select('student_id, item_id, completed, submitted_at')
+      .in('student_id', studentIds).in('item_id', itemIds);
+    progress = pData || [];
+  }
+  // progress index: studentId -> itemId -> row
+  const progressMap = {};
+  progress.forEach(p => {
+    if(!progressMap[p.student_id]) progressMap[p.student_id] = {};
+    progressMap[p.student_id][p.item_id] = p;
+  });
+
+  // ===== 5. Exam scores =====
+  const examItemIds = items.filter(i => i.type === 'exam').map(i => i.id);
+  let examScores = [];
+  if(examItemIds.length > 0 && studentIds.length > 0){
+    const { data: esData } = await sb.from('exam_scores').select('*')
+      .in('student_id', studentIds).in('item_id', examItemIds)
+      .order('attempt_no', { ascending: false });
+    examScores = esData || [];
+  }
+  // examMap: studentId -> itemId -> {latest, avg, count}
+  const examMap = {};
+  examScores.forEach(es => {
+    if(!examMap[es.student_id]) examMap[es.student_id] = {};
+    if(!examMap[es.student_id][es.item_id]){
+      examMap[es.student_id][es.item_id] = { latest: es, scores: [], count: 0 };
+    }
+    examMap[es.student_id][es.item_id].scores.push(es.score);
+    examMap[es.student_id][es.item_id].count++;
+  });
+
+  // ===== 6. Attendance =====
+  const today = new Date();
+  const rangeDays = dashState.rangeFilter === 'week' ? 7 : 30;
+  const startDate = new Date(today);
+  startDate.setDate(startDate.getDate() - rangeDays + 1);
+  const startKey = fmtDateInput(startDate);
+  const endKey = fmtDateInput(today);
+
+  let attendance = [];
+  if(studentIds.length > 0){
+    const { data: aData } = await sb.from('attendance').select('*')
+      .in('student_id', studentIds)
+      .gte('attend_date', startKey).lte('attend_date', endKey);
+    attendance = aData || [];
+  }
+
+  return {
+    students, studentMap, enrollMap,
+    chapters: chapters || [], topics, items, itemSubject,
+    progress, progressMap, examScores, examMap, attendance,
+    rangeDays
+  };
+}
+
+function renderDashContent(data){
+  const body = $('dash_body');
+  let html = '';
+
+  // ============== KPI ==============
+  html += `<div class="dash-section-title">📈 ภาพรวม</div>`;
+  html += renderKPI(data);
+
+  // ============== Heatmap ==============
+  html += `<div class="dash-section-title">🔥 Heatmap — นักเรียน × วิชา</div>`;
+  html += renderHeatmap(data);
+
+  // ============== Bar chart per subject ==============
+  html += `<div class="dash-section-title">📊 ความคืบหน้าเฉลี่ยต่อวิชา</div>`;
+  html += renderSubjectBars(data);
+
+  // ============== Top/Bottom ==============
+  html += `<div class="dash-section-title">🏆 อันดับนักเรียน</div>`;
+  html += renderTopBottom(data);
+
+  // ============== Attendance Summary ==============
+  html += `<div class="dash-section-title">📅 สรุปการมาเรียน (${data.rangeDays} วันล่าสุด)</div>`;
+  html += renderAttSummary(data);
+
+  // ============== Alerts ==============
+  html += `<div class="dash-section-title">🆘 กลุ่ม Help me pls</div>`;
+  html += renderAlerts(data);
+
+  body.innerHTML = html;
+}
+
+// ===== KPI =====
+function renderKPI(data){
+  const totalStudents = data.students.length;
+
+  // Active today = นักเรียนที่มี attendance record วันนี้
+  const todayKey = fmtDateInput(new Date());
+  const activeIds = new Set(data.attendance.filter(a => a.attend_date === todayKey).map(a => a.student_id));
+  const activeToday = activeIds.size;
+
+  // งานเลย deadline ทั้งระบบ
+  const now = new Date();
+  let overdueCount = 0;
+  data.items.forEach(it => {
+    if(it.type !== 'assignment' || !it.deadline) return;
+    if(new Date(it.deadline) >= now) return;
+    // นับนักเรียนที่ enroll subject นี้ + ยังไม่ done
+    const subId = data.itemSubject[it.id];
+    data.students.forEach(s => {
+      if(!data.enrollMap[s.id]?.has(subId)) return;
+      const p = data.progressMap[s.id]?.[it.id];
+      if(!p?.completed) overdueCount++;
+    });
+  });
+
+  // คะแนนเฉลี่ยทั้งระบบ
+  let scoreSum = 0, scoreMax = 0;
+  data.examScores.forEach(es => {
+    // เอาเฉพาะ attempt ล่าสุด - แต่ใน loop นี้ลำบาก, ใช้ทั้งหมดให้ง่าย
+    const it = data.items.find(i => i.id === es.item_id);
+    if(!it?.max_score) return;
+    scoreSum += es.score;
+    scoreMax += it.max_score;
+  });
+  const avgScore = scoreMax > 0 ? Math.round((scoreSum / scoreMax) * 100) : null;
+
+  return `<div class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-icon">👥</div>
+      <div class="kpi-num">${totalStudents}</div>
+      <div class="kpi-label">นักเรียนทั้งหมด</div>
+    </div>
+    <div class="kpi-card ok">
+      <div class="kpi-icon">✅</div>
+      <div class="kpi-num">${activeToday}</div>
+      <div class="kpi-label">มาเรียนวันนี้</div>
+      <div class="kpi-sub">จาก ${totalStudents} คน</div>
+    </div>
+    <div class="kpi-card ${overdueCount > 0 ? 'err' : 'ok'}">
+      <div class="kpi-icon">⏰</div>
+      <div class="kpi-num">${overdueCount}</div>
+      <div class="kpi-label">งานเลย Deadline</div>
+      <div class="kpi-sub">รวมทุกนักเรียน</div>
+    </div>
+    <div class="kpi-card ${avgScore == null ? '' : (avgScore >= 50 ? 'ok' : 'warn')}">
+      <div class="kpi-icon">📊</div>
+      <div class="kpi-num">${avgScore == null ? '-' : avgScore + '%'}</div>
+      <div class="kpi-label">คะแนนเฉลี่ย</div>
+      <div class="kpi-sub">รวมทุกข้อสอบ</div>
+    </div>
+  </div>`;
+}
+
+// ===== Heatmap =====
+function renderHeatmap(data){
+  if(data.students.length === 0){
+    return `<div class="dash-empty">ไม่มีนักเรียน</div>`;
+  }
+  if(data.items.length === 0){
+    return `<div class="dash-empty">ยังไม่มีหลักสูตร — เพิ่มที่แท็บ "หลักสูตร"</div>`;
+  }
+
+  // คำนวณ progress + คะแนน ของแต่ละ student×subject
+  const subjectStat = {}; // studentId -> subjectId -> {done, total, scoreSum, scoreMax, hasItems}
+  data.students.forEach(s => {
+    subjectStat[s.id] = {};
+    subjectsCache.forEach(sub => {
+      subjectStat[s.id][sub.id] = { done:0, total:0, scoreSum:0, scoreMax:0, hasItems:false };
+    });
+  });
+
+  // นับ total + done สำหรับแต่ละ student × subject
+  data.items.forEach(it => {
+    const subId = data.itemSubject[it.id];
+    if(!subId) return;
+    data.students.forEach(s => {
+      if(!data.enrollMap[s.id]?.has(subId)) return;
+      const stat = subjectStat[s.id][subId];
+      stat.hasItems = true;
+      stat.total++;
+      if(it.type === 'lesson' || it.type === 'assignment'){
+        if(data.progressMap[s.id]?.[it.id]?.completed) stat.done++;
+      } else if(it.type === 'exam'){
+        // มีคะแนน 1+ ครั้ง = done
+        const exam = data.examMap[s.id]?.[it.id];
+        if(exam) stat.done++;
+        // คำนวณคะแนน latest
+        if(exam && it.max_score){
+          stat.scoreSum += exam.latest.score;
+          stat.scoreMax += it.max_score;
+        }
+      }
+    });
+  });
+
+  // header row
+  let html = `<div class="heatmap-wrap"><table class="heatmap"><thead><tr>
+    <th style="background:transparent;color:var(--t2);"></th>`;
+  subjectsCache.forEach(sub => {
+    html += `<th style="background:${sub.color}" title="${escapeHtml(sub.name)}">${sub.icon}</th>`;
+  });
+  html += `</tr></thead><tbody>`;
+
+  // sort students by progress desc
+  const studentSorted = [...data.students].sort((a,b) => {
+    const sumA = subjectsCache.reduce((acc, sub) => {
+      const st = subjectStat[a.id][sub.id];
+      return acc + (st.total > 0 ? st.done / st.total : 0);
+    }, 0);
+    const sumB = subjectsCache.reduce((acc, sub) => {
+      const st = subjectStat[b.id][sub.id];
+      return acc + (st.total > 0 ? st.done / st.total : 0);
+    }, 0);
+    return sumB - sumA;
+  });
+
+  studentSorted.forEach(s => {
+    html += `<tr><td class="name-cell" title="${escapeHtml(s.nickname)}">${escapeHtml(s.nickname)}</td>`;
+    subjectsCache.forEach(sub => {
+      const st = subjectStat[s.id][sub.id];
+      const enrolled = data.enrollMap[s.id]?.has(sub.id);
+      if(!enrolled){
+        html += `<td class="cell empty">—</td>`;
+        return;
+      }
+      if(!st.hasItems){
+        html += `<td class="cell" style="background:#E5E7EB;color:var(--t3);">·</td>`;
+        return;
+      }
+      const pct = st.total > 0 ? Math.round((st.done / st.total) * 100) : 0;
+      const scorePct = st.scoreMax > 0 ? Math.round((st.scoreSum / st.scoreMax) * 100) : null;
+      const bg = pctToHeatColor(pct);
+      html += `<td class="cell" style="background:${bg};" 
+        onclick="openTrackingFromHeatmap('${s.id}', \`${escapeHtml(s.nickname).replace(/`/g,'\\`')}\`, '${sub.id}', \`${escapeHtml(sub.name).replace(/`/g,'\\`')}\`)">
+        <span class="heatmap-cell-pct">${pct}%</span>
+        ${scorePct != null ? `<span class="heatmap-cell-sub">📊${scorePct}</span>` : ''}
+      </td>`;
+    });
+    html += `</tr>`;
+  });
+  html += `</tbody></table>
+    <div class="heatmap-legend">
+      <span>0%</span>
+      <div class="heatmap-legend-bar" style="background:#FCA5A5;"></div>
+      <div class="heatmap-legend-bar" style="background:#FCD34D;"></div>
+      <div class="heatmap-legend-bar" style="background:#86EFAC;"></div>
+      <div class="heatmap-legend-bar" style="background:#10B981;"></div>
+      <span>100%</span>
+    </div>
+    <div style="font-size:10px;color:var(--t3);margin-top:4px;line-height:1.6;">
+      • <strong>%</strong> = ความคืบหน้า, <strong>📊</strong> = คะแนนสอบ<br>
+      • <strong>·</strong> = เรียนวิชานี้แต่ยังไม่มีเนื้อหา &nbsp; <strong>—</strong> = ไม่ได้เรียนวิชานี้
+    </div>
+  </div>`;
+  return html;
+}
+
+function pctToHeatColor(pct){
+  // 0-25: red, 25-50: orange, 50-75: yellow-green, 75-100: green
+  if(pct < 25) return '#EF4444';
+  if(pct < 50) return '#F59E0B';
+  if(pct < 75) return '#84CC16';
+  return '#10B981';
+}
+
+function openTrackingFromHeatmap(studentId, studentName, subjectId, subjectName){
+  currentTab = 'tracking';
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === 'tracking');
+  });
+  navStack = [
+    { view:'track-subjects', studentId, studentName },
+    { view:'track-items', studentId, studentName, subjectId, subjectName }
+  ];
+  saveNavState();
+  renderCurrentView();
+}
+
+// ===== Subject Bar chart =====
+function renderSubjectBars(data){
+  // คำนวณ progress เฉลี่ยของแต่ละ subject (เฉลี่ยข้ามนักเรียนที่ enroll)
+  const stat = {}; // subjectId -> {sumPct, count}
+  subjectsCache.forEach(sub => {
+    stat[sub.id] = { sumPct: 0, count: 0 };
+  });
+
+  data.students.forEach(s => {
+    subjectsCache.forEach(sub => {
+      if(!data.enrollMap[s.id]?.has(sub.id)) return;
+      // นับ items ในวิชานี้
+      let total = 0, done = 0;
+      data.items.forEach(it => {
+        if(data.itemSubject[it.id] !== sub.id) return;
+        total++;
+        if(it.type === 'lesson' || it.type === 'assignment'){
+          if(data.progressMap[s.id]?.[it.id]?.completed) done++;
+        } else if(it.type === 'exam'){
+          if(data.examMap[s.id]?.[it.id]) done++;
+        }
+      });
+      if(total > 0){
+        stat[sub.id].sumPct += (done / total) * 100;
+        stat[sub.id].count++;
+      }
+    });
+  });
+
+  let html = `<div class="bar-chart">`;
+  subjectsCache.forEach(sub => {
+    const s = stat[sub.id];
+    const pct = s.count > 0 ? Math.round(s.sumPct / s.count) : 0;
+    const displayPct = s.count > 0 ? pct : 0;
+    html += `<div class="bar-row">
+      <div class="bar-row-name">${sub.icon} <span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(sub.name)}</span></div>
+      <div class="bar-row-track">
+        <div class="bar-row-fill" style="background:${sub.color};width:${displayPct}%;">
+          ${displayPct}%
+        </div>
+      </div>
+    </div>`;
+  });
+  html += `</div>`;
+  return html;
+}
+
+// ===== Top/Bottom =====
+function renderTopBottom(data){
+  // คำนวณ overall progress ของแต่ละนักเรียน
+  const stuStats = data.students.map(s => {
+    let total = 0, done = 0;
+    subjectsCache.forEach(sub => {
+      if(!data.enrollMap[s.id]?.has(sub.id)) return;
+      data.items.forEach(it => {
+        if(data.itemSubject[it.id] !== sub.id) return;
+        total++;
+        if(it.type === 'lesson' || it.type === 'assignment'){
+          if(data.progressMap[s.id]?.[it.id]?.completed) done++;
+        } else if(it.type === 'exam'){
+          if(data.examMap[s.id]?.[it.id]) done++;
+        }
+      });
+    });
+    return { student: s, total, done, pct: total > 0 ? (done / total) * 100 : 0 };
+  });
+
+  // filter เฉพาะคนที่มี items ให้ทำ
+  const withItems = stuStats.filter(x => x.total > 0);
+  if(withItems.length === 0){
+    return `<div class="dash-empty">ยังไม่มีข้อมูลความคืบหน้า</div>`;
+  }
+
+  const top = [...withItems].sort((a,b) => b.pct - a.pct).slice(0, 5);
+  const bottom = [...withItems].sort((a,b) => a.pct - b.pct).slice(0, 5);
+
+  let html = '';
+
+  // Top
+  html += `<div style="font-size:12px;color:var(--t2);font-weight:700;margin-bottom:6px;">🥇 อันดับนำ</div>`;
+  top.forEach((x, idx) => {
+    const rankCls = idx === 0 ? 'gold' : idx === 1 ? 'silver' : idx === 2 ? 'bronze' : '';
+    html += `<div class="perf-row" onclick="openStudentFromDash('${x.student.id}', \`${escapeHtml(x.student.nickname).replace(/`/g,'\\`')}\`)">
+      <div class="perf-rank ${rankCls}">${idx + 1}</div>
+      <div class="perf-name">${escapeHtml(x.student.nickname)}</div>
+      <div class="perf-pct" style="color:${pctToHeatColor(Math.round(x.pct))}">${Math.round(x.pct)}%</div>
+    </div>`;
+  });
+
+  // Bottom (ต้องการความช่วยเหลือ)
+  if(bottom.length > 0 && bottom[0].student.id !== top[top.length-1]?.student.id){
+    html += `<div style="font-size:12px;color:var(--t2);font-weight:700;margin:14px 0 6px;">📉 ต้องการความช่วยเหลือ</div>`;
+    bottom.forEach((x, idx) => {
+      html += `<div class="perf-row" onclick="openStudentFromDash('${x.student.id}', \`${escapeHtml(x.student.nickname).replace(/`/g,'\\`')}\`)">
+        <div class="perf-rank danger">!</div>
+        <div class="perf-name">${escapeHtml(x.student.nickname)}</div>
+        <div class="perf-pct" style="color:${pctToHeatColor(Math.round(x.pct))}">${Math.round(x.pct)}%</div>
+      </div>`;
+    });
+  }
+
+  return html;
+}
+
+function openStudentFromDash(studentId, studentName){
+  currentTab = 'students';
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === 'students');
+  });
+  navStack = [{ view:'student-detail', studentId, studentName }];
+  studentDetailTab = 'info';
+  saveNavState();
+  renderCurrentView();
+}
+
+// ===== Attendance Summary =====
+function renderAttSummary(data){
+  // นับสถานะรวม
+  const counts = { on_time:0, late:0, online:0, absent:0 };
+  data.attendance.forEach(a => { counts[a.status] = (counts[a.status] || 0) + 1; });
+  const total = counts.on_time + counts.late + counts.online + counts.absent;
+
+  if(total === 0){
+    return `<div class="att-summary">
+      <div class="dash-empty">ยังไม่มีข้อมูลเช็คชื่อใน ${data.rangeDays} วันล่าสุด</div>
+    </div>`;
+  }
+
+  // นับสาย/ขาดต่อนักเรียน
+  const perStudent = {}; // studentId -> {late, absent}
+  data.attendance.forEach(a => {
+    if(!perStudent[a.student_id]) perStudent[a.student_id] = { late:0, absent:0 };
+    if(a.status === 'late') perStudent[a.student_id].late++;
+    if(a.status === 'absent') perStudent[a.student_id].absent++;
+  });
+
+  // คนที่ขาดเยอะสุด
+  const absentList = Object.entries(perStudent)
+    .filter(([_, v]) => v.absent > 0)
+    .sort((a,b) => b[1].absent - a[1].absent)
+    .slice(0, 5);
+
+  // คนที่สายเยอะสุด
+  const lateList = Object.entries(perStudent)
+    .filter(([_, v]) => v.late > 0)
+    .sort((a,b) => b[1].late - a[1].late)
+    .slice(0, 5);
+
+  let html = `<div class="att-summary">
+    <div class="att-sum-stats">
+      <div class="att-sum-card on_time">
+        <div class="att-sum-num">${counts.on_time}</div>
+        <div class="att-sum-label">ตรงเวลา</div>
+      </div>
+      <div class="att-sum-card late">
+        <div class="att-sum-num">${counts.late}</div>
+        <div class="att-sum-label">มาสาย</div>
+      </div>
+      <div class="att-sum-card online">
+        <div class="att-sum-num">${counts.online}</div>
+        <div class="att-sum-label">ออนไลน์</div>
+      </div>
+      <div class="att-sum-card absent">
+        <div class="att-sum-num">${counts.absent}</div>
+        <div class="att-sum-label">ขาด</div>
+      </div>
+    </div>`;
+
+  if(absentList.length > 0){
+    html += `<div class="att-sum-list-title">นักเรียนที่ขาดบ่อย</div>`;
+    absentList.forEach(([sid, v]) => {
+      const stu = data.studentMap[sid];
+      if(!stu) return;
+      html += `<div class="perf-row" style="margin-bottom:4px;" onclick="openStudentFromDash('${stu.id}', \`${escapeHtml(stu.nickname).replace(/`/g,'\\`')}\`)">
+        <div class="avatar sm">${(stu.nickname||'?').charAt(0).toUpperCase()}</div>
+        <div class="perf-name">${escapeHtml(stu.nickname)}</div>
+        <div class="perf-pct" style="color:var(--err);">ขาด ${v.absent} ครั้ง</div>
+      </div>`;
+    });
+  }
+  if(lateList.length > 0){
+    html += `<div class="att-sum-list-title">นักเรียนที่มาสายบ่อย</div>`;
+    lateList.forEach(([sid, v]) => {
+      const stu = data.studentMap[sid];
+      if(!stu) return;
+      html += `<div class="perf-row" style="margin-bottom:4px;" onclick="openStudentFromDash('${stu.id}', \`${escapeHtml(stu.nickname).replace(/`/g,'\\`')}\`)">
+        <div class="avatar sm">${(stu.nickname||'?').charAt(0).toUpperCase()}</div>
+        <div class="perf-name">${escapeHtml(stu.nickname)}</div>
+        <div class="perf-pct" style="color:var(--warn);">สาย ${v.late} ครั้ง</div>
+      </div>`;
+    });
+  }
+  html += `</div>`;
+  return html;
+}
+
+// ===== Alerts =====
+function renderAlerts(data){
+  const alerts = [];
+  const now = new Date();
+
+  // 1. งานเลย deadline ≥ 2 ชิ้น per student
+  data.students.forEach(s => {
+    let overdue = 0;
+    data.items.forEach(it => {
+      if(it.type !== 'assignment' || !it.deadline) return;
+      if(new Date(it.deadline) >= now) return;
+      const subId = data.itemSubject[it.id];
+      if(!data.enrollMap[s.id]?.has(subId)) return;
+      const p = data.progressMap[s.id]?.[it.id];
+      if(!p?.completed) overdue++;
+    });
+    if(overdue >= 2){
+      alerts.push({
+        type: 'deadline',
+        icon: '⏰',
+        title: `${s.nickname} ค้างส่งงาน ${overdue} ชิ้น`,
+        sub: 'งานเลย deadline ที่ยังไม่ส่ง',
+        studentId: s.id,
+        studentName: s.nickname
+      });
+    }
+  });
+
+  // 2. สอบไม่ผ่าน (<30%) เกินครึ่งของจำนวนสอบทั้งหมด
+  data.students.forEach(s => {
+    let totalExams = 0;
+    let failedExams = 0;
+    Object.entries(data.examMap[s.id] || {}).forEach(([itemId, exam]) => {
+      const it = data.items.find(i => i.id === itemId);
+      if(!it?.max_score) return;
+      totalExams++;
+      const pct = (exam.latest.score / it.max_score) * 100;
+      if(pct < 30) failedExams++;
+    });
+    // ต้องสอบอย่างน้อย 2 ครั้ง + ตกเกินครึ่ง
+    if(totalExams >= 2 && failedExams > totalExams / 2){
+      alerts.push({
+        type: 'exam',
+        icon: '📉',
+        title: `${s.nickname} สอบไม่ผ่าน ${failedExams}/${totalExams} ครั้ง`,
+        sub: `คะแนน < 30% เกินครึ่งของการสอบ`,
+        studentId: s.id,
+        studentName: s.nickname
+      });
+    }
+  });
+
+  // 3. ขาดเรียน ≥ 2 วันติดต่อกัน
+  data.students.forEach(s => {
+    // group dates ของนักเรียนคนนี้ที่ absent
+    const absentDates = new Set();
+    data.attendance.filter(a => a.student_id === s.id && a.status === 'absent')
+      .forEach(a => absentDates.add(a.attend_date));
+    if(absentDates.size === 0) return;
+    // เรียง วันแล้วเช็คว่ามี 2 วันติดกันไหม
+    const sorted = [...absentDates].sort();
+    let maxStreak = 1, curStreak = 1;
+    for(let i = 1; i < sorted.length; i++){
+      const prev = new Date(sorted[i-1]);
+      const cur = new Date(sorted[i]);
+      const diff = (cur - prev) / 86400000;
+      if(diff === 1){
+        curStreak++;
+        if(curStreak > maxStreak) maxStreak = curStreak;
+      } else {
+        curStreak = 1;
+      }
+    }
+    if(maxStreak >= 2){
+      alerts.push({
+        type: 'absent',
+        icon: '🚷',
+        title: `${s.nickname} ขาดเรียนติดกัน ${maxStreak} วัน`,
+        sub: `ใน ${data.rangeDays} วันล่าสุด`,
+        studentId: s.id,
+        studentName: s.nickname
+      });
+    }
+  });
+
+  if(alerts.length === 0){
+    return `<div class="att-summary"><div class="dash-empty">✨ ทุกคนทำได้ดี ไม่มีใครต้องการความช่วยเหลือ</div></div>`;
+  }
+
+  return alerts.map(a => `
+    <div class="alert-card ${a.type}" onclick="openStudentFromDash('${a.studentId}', \`${escapeHtml(a.studentName).replace(/`/g,'\\`')}\`)">
+      <div class="alert-icon">${a.icon}</div>
+      <div class="alert-body">
+        <div class="alert-title">${escapeHtml(a.title)}</div>
+        <div class="alert-sub">${escapeHtml(a.sub)}</div>
+      </div>
+    </div>`).join('');
+}
+
+// ====================================================
+// ====== REALTIME (Bell auto-refresh) =================
+// ====================================================
+let realtimeChannel = null;
+
+function startRealtimeBell(){
+  if(!currentProfile || currentProfile.role !== 'admin') return;
+  if(realtimeChannel){
+    sb.removeChannel(realtimeChannel);
+    realtimeChannel = null;
+  }
+  realtimeChannel = sb.channel('profiles-changes')
+    .on('postgres_changes', {
+      event: '*',
+      schema: 'public',
+      table: 'profiles'
+    }, async () => {
+      await refreshPendingCount();
+      if(currentTab === 'pending-users'){
+        renderPendingUsersList();
+      }
+    })
+    .subscribe();
+}
+
+function stopRealtimeBell(){
+  if(realtimeChannel){
+    sb.removeChannel(realtimeChannel);
+    realtimeChannel = null;
+  }
+}
+
+
+function onFabClick(){
+  if(currentTab === 'curriculum'){
+    const view = navStack[navStack.length-1];
+    if(!view){
+      openSubjectModal(null);
+    } else if(view.view === 'tracks-list'){
+      openTrackModal(null);
+    } else if(view.view === 'chapters'){
+      openChapterModal(null);
+    } else if(view.view === 'topics'){
+      openTopicModal(null);
+    } else if(view.view === 'items'){
+      openItemModal(null);
+    }
+  } else if(currentTab === 'students'){
+    const view = navStack[navStack.length-1];
+    if(!view){ // หน้า list
+      openStudentModal(null);
+    }
+  }
+}
+
+// ====== SORTABLE (Drag & Drop) ======
+function setupSortable(elemId, tableName){
+  const el = document.getElementById(elemId);
+  if(!el) return;
+  Sortable.create(el, {
+    handle: '.drag-handle',
+    animation: 150,
+    ghostClass: 'dragging',
+    onEnd: async (evt) => {
+      // อ่าน order ใหม่
+      const ids = Array.from(el.children).map(c => c.dataset.id);
+      // batch update
+      const updates = ids.map((id, idx) => ({ id, order_index: idx }));
+      // ทำทีละตัว (Supabase ไม่ support bulk update with different values)
+      for(const u of updates){
+        await sb.from(tableName).update({ order_index: u.order_index }).eq('id', u.id);
+      }
+      toast('เรียงใหม่เรียบร้อย', 'success');
+    }
+  });
+}
+
+// ====== MODAL ======
+function showModal({ title, body, onSave, saveText='บันทึก' }){
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  const viewOnly = !onSave;
+  bg.innerHTML = `
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-handle"></div>
+      <div class="modal-title">${title}</div>
+      <div id="modalBody">${body}</div>
+      <div class="modal-actions">
+        <button class="btn-sec" id="modalCancel">${viewOnly ? 'ปิด' : 'ยกเลิก'}</button>
+        ${viewOnly ? '' : `<button class="btn-pri" id="modalSave" style="margin-top:0;">${saveText}</button>`}
+      </div>
+    </div>
+  `;
+  document.body.appendChild(bg);
+  bg.addEventListener('click', () => closeModal(bg));
+  bg.querySelector('#modalCancel').onclick = () => closeModal(bg);
+  if(!viewOnly){
+    bg.querySelector('#modalSave').onclick = async () => {
+      const btn = bg.querySelector('#modalSave');
+      btn.disabled = true; btn.textContent = 'กำลังบันทึก...';
+      const ok = await onSave();
+      btn.disabled = false; btn.textContent = saveText;
+      if(ok !== false) closeModal(bg);
+    };
+  }
+}
+function closeModal(bg){
+  bg.style.animation = 'fadeIn 0.2s reverse';
+  setTimeout(() => bg.remove(), 180);
+}
+
+// ====== SERVICE WORKER (PWA) ======
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register(import.meta.env.BASE_URL + 'service-worker.js')
+      .then(reg => {
+        // เช็ค update ทันทีตอนเปิดแอป
+        reg.update();
+        // ถ้ามี SW ใหม่กำลังรอ — บอกให้ activate ทันที + reload หน้า
+        reg.addEventListener('updatefound', () => {
+          const newSW = reg.installing;
+          if(!newSW) return;
+          newSW.addEventListener('statechange', () => {
+            if(newSW.state === 'installed' && navigator.serviceWorker.controller){
+              // มี SW ใหม่พร้อมใช้ — บอกให้ activate
+              newSW.postMessage({ type: 'SKIP_WAITING' });
+            }
+          });
+        });
+      })
+      .catch(err => console.warn('SW register failed:', err));
+
+    // เมื่อ SW ใหม่ activate แล้ว → reload หน้าอัตโนมัติ
+    let refreshing = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if(refreshing) return;
+      refreshing = true;
+      window.location.reload();
+    });
+  });
+}
+
+// ====== INIT ======
+(async function init(){
+  const { data: { session } } = await sb.auth.getSession();
+  if(session){
+    await routeUser();
+  } else {
+    hide('appPage'); show('authPage'); showLogin();
+  }
+  hide('loader');
+})();
+
+sb.auth.onAuthStateChange((event) => {
+  if(event === 'SIGNED_OUT'){ hide('appPage'); show('authPage'); showLogin(); }
+});
+
+// ===== Expose ฟังก์ชันสู่ window เพื่อให้ inline onclick handler ทำงาน (auto-generated) =====
+Object.assign(window, {
+  sb, Sortable,
+  approveAs,
+  approveAsStudent,
+  attendanceInit,
+  bulkAttInit,
+  bulkClearAll,
+  bulkSetAll,
+  calcMyProgress,
+  changeAttendanceMonth,
+  changeBulkDate,
+  clearAttendance,
+  clearBulkAttendance,
+  clearBulkSubject,
+  clearStudentDetailCache,
+  closeAllModalsThen,
+  closeModal,
+  confirmDeleteSubmission,
+  deleteChapter,
+  deleteExamScore,
+  deleteItem,
+  deleteStudent,
+  deleteSubmission,
+  deleteTopic,
+  deleteTrack,
+  doLogin,
+  doLogout,
+  doRegister,
+  downloadSubmission,
+  downloadSubmissionById,
+  dpClear,
+  dpSetToday,
+  editChapter,
+  editExamScore,
+  editItem,
+  editStudent,
+  editSubjectById,
+  editTopic,
+  editTrack,
+  escapeHtml,
+  fileIcon,
+  fillAttendance,
+  fmtDate,
+  fmtDateDM,
+  fmtDateInput,
+  fmtFileSize,
+  getMinMonth,
+  getMyStudentId,
+  goBack,
+  hide,
+  jumpToBreadcrumb,
+  listSubmissions,
+  loadDashboardData,
+  loadMyStudentData,
+  loadSubjects,
+  loadTracksCache,
+  onApproveStudentChange,
+  onDatePickerChange,
+  onFabClick,
+  onGradeSelectChange,
+  onItemTypeChange,
+  onStudentSearch,
+  onSubmissionFilesPicked,
+  onTrackingSearch,
+  openAttendanceDay,
+  openBulkAction,
+  openChapter,
+  openChapterModal,
+  openDatePickerFor,
+  openExamHistory,
+  openExamScore,
+  openItemModal,
+  openLinkStudent,
+  openLinkUrl,
+  openMyExamHistory,
+  openPendingUsers,
+  openStudent,
+  openStudentAttendanceDay,
+  openStudentFromDash,
+  openStudentLearnSubject,
+  openStudentModal,
+  openSubject,
+  openSubjectModal,
+  openSubmissionsForItem,
+  openSubmissionsModal,
+  openTopic,
+  openTopicModal,
+  openTrack,
+  openTrackModal,
+  openTrackingFromHeatmap,
+  openTrackingStudent,
+  openTrackingSubject,
+  openTracksList,
+  pctToHeatColor,
+  pushNav,
+  refreshAttendanceModalBody,
+  refreshDashboard,
+  refreshPendingCount,
+  refreshStudentCalendarOnly,
+  registerDatePickerCallback,
+  rejectPending,
+  renderAlerts,
+  renderApp,
+  renderAttSummary,
+  renderAttendanceCalendar,
+  renderBreadcrumb,
+  renderBulkAttStudentList,
+  renderBulkAttSubjectSelect,
+  renderBulkAttendance,
+  renderBulkDateRow,
+  renderChaptersList,
+  renderCurrentView,
+  renderCurriculum,
+  renderDashContent,
+  renderDashShell,
+  renderDashboard,
+  renderDatePickerBtn,
+  renderDeletedToggle,
+  renderHeatmap,
+  renderItemsList,
+  renderKPI,
+  renderPendingUsersList,
+  renderPlaceholder,
+  renderStudentAttendance,
+  renderStudentDetail,
+  renderStudentDetailContent,
+  renderStudentDetailShell,
+  renderStudentHome,
+  renderStudentLearn,
+  renderStudentLearnItems,
+  renderStudentLearnSubjects,
+  renderStudentScores,
+  renderStudentTrackItem,
+  renderStudents,
+  renderStudentsList,
+  renderSubjectBars,
+  renderSubjectsPageHome,
+  renderSubmissionRow,
+  renderTabBar,
+  renderTopBottom,
+  renderTopicsList,
+  renderTrackItem,
+  renderTracking,
+  renderTrackingItemsPage,
+  renderTrackingStudentList,
+  renderTrackingSubjectsPage,
+  renderTracksList,
+  restoreItem2,
+  restoreNavState,
+  routeUser,
+  saveNavState,
+  setAttendance,
+  setAttendanceSubject,
+  setBulkAttendance,
+  setBulkDate,
+  setBulkSubject,
+  setDashRange,
+  setDashTrack,
+  setItemFilter,
+  setStudentDetailTab,
+  setupSortable,
+  show,
+  showLogin,
+  showModal,
+  showPending,
+  showRegister,
+  startRealtimeBell,
+  statusLabel,
+  stopRealtimeBell,
+  switchTab,
+  toast,
+  toggleChapter,
+  toggleDeleted,
+  toggleEnroll,
+  toggleProgress,
+  toggleStudentChapter,
+  unlinkStudent,
+  updateBulkStats,
+  updateCalendarDot,
+  updateChapterBadge,
+  updateDatePickerBtn,
+  updateExamPercent,
+  uploadSubmission,
+});
